@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 from http.client import HTTPException
 import ipaddress
 import json
@@ -27,6 +28,11 @@ PROTOCOL_VERSION = "2025-03-26"
 MAX_BODY = 1024 * 1024
 MAX_OUTPUT = 24000
 MAX_ARGUMENTS = 16384
+TARGET_CACHE_LIMIT = 32
+TARGET_CACHE_TTL = 3 * 86400
+ALIAS_LIMIT = 32
+TARGET_DOMAINS = frozenset({"light", "switch", "scene", "fan", "climate", "media_player", "script"})
+SAVE_ALIAS_TOOL = "ha_SaveAlias"
 # These are device/read intents. Administrative, messaging and security tools
 # are not added merely because a future server offers them.
 ASSIST_TOOLS = frozenset({
@@ -111,6 +117,12 @@ def _semantic_failure(value: Any) -> str | None:
     return None
 
 
+def _tool_payload(value: Any) -> Any:
+    if isinstance(value, dict) and value.get("success") is True and isinstance(value.get("result"), dict):
+        return value["result"]
+    return value
+
+
 def _base_url(value: Any) -> str:
     if not isinstance(value, str):
         raise HomeAssistantError("invalid_auth_config")
@@ -160,12 +172,12 @@ def _read_auth(path: Path) -> dict[str, Any]:
     return data
 
 
-def _save_auth(path: Path, data: dict[str, Any]) -> None:
+def _save_private_json(path: Path, data: dict[str, Any]) -> None:
     temporary = None
     try:
         if path.is_symlink():
             raise HomeAssistantError("auth_file_permissions")
-        fd, temporary = tempfile.mkstemp(prefix=".ha-auth-", dir=path.parent)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             json.dump(data, output, separators=(",", ":"), allow_nan=False)
             output.flush()
@@ -232,13 +244,54 @@ def _decode_response(response: Any, request_id: int | None, *, deadline: float |
         raise HomeAssistantError("invalid_mcp_response") from None
 
 
+def _target_label(value: Any) -> str | None:
+    """Keep short labels, never credentials, prose, or raw tool arguments."""
+    if isinstance(value, str) and re.fullmatch(r"""[\w][\w .()&+'’/"″-]{0,79}""", value):
+        if diagnostic_text(value, 80) == value:
+            return value
+    return None
+
+
+def _alias_key(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    key = " ".join(value.casefold().split())
+    key = re.sub(r"(?<=[a-z]) (?=\d)", "", key)
+    return key if re.fullmatch(r"[\w][\w -]{0,39}", key) else None
+
+
+def _lookup_without_suffix(arguments: dict[str, Any]) -> dict[str, Any] | None:
+    label = _target_label(arguments.get("name"))
+    if not label:
+        return None
+    match = re.fullmatch(r"(.+?)(lampgroep|lampen|lamp|sc[eè]ne)", label, re.IGNORECASE)
+    if not match:
+        return None
+    candidate = match[1].rstrip(" -_")
+    if len(candidate) < 3 or candidate.casefold() in {"alle", "allemaal", "deze", "groep", "iedere", "welke"}:
+        return None
+    domain = "light" if match[2].lower().startswith("lamp") else "scene"
+    if arguments.get("domain") not in (None, domain, [domain]):
+        return None
+    return {**arguments, "name": candidate, "domain": domain}
+
+
 class HomeAssistantTools:
-    def __init__(self, auth_path: Path, *, timeout: float = 8.0):
+    def __init__(self, auth_path: Path, *, timeout: float = 8.0, scripts: tuple[str, ...] = (),
+                 cache_path: Path | None = None):
         if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise HomeAssistantError("invalid_timeout")
         self._path = Path(auth_path)
         self._auth = _read_auth(self._path)
         self._timeout = timeout
+        if any(not re.fullmatch(r"[a-z0-9_]{1,54}", name) for name in scripts):
+            raise ValueError("Gebruik objectnamen zonder script. in STACKCHAN_HA_SCRIPTS")
+        self._scripts = frozenset(scripts)
+        self._cache_path = cache_path
+        self._cache_home = hashlib.sha256(self._auth["base_url"].encode()).hexdigest()
+        self._cache_lock = asyncio.Lock()
+        self._targets: dict[tuple[str, ...], dict[str, Any]] = {}
+        self._aliases: dict[str, dict[str, Any]] = {}
         self._opener = build_opener(ProxyHandler({}), _NoRedirect())
         self._auth_lock = asyncio.Lock()
         self._transport_lock = asyncio.Lock()
@@ -291,7 +344,7 @@ class HomeAssistantTools:
                     or not isinstance(expiry, (int, float)) or not math.isfinite(expiry) or expiry <= 0):
                 raise HomeAssistantError("invalid_auth_response")
             updated = {**self._auth, "access_token": token, "expires_at": time.time() + expiry}
-            await _finish_thread(_save_auth, self._path, updated)
+            await _finish_thread(_save_private_json, self._path, updated)
             self._auth = updated
 
     async def _rpc(self, method: str, params: dict[str, Any] | None = None,
@@ -337,9 +390,11 @@ class HomeAssistantTools:
             if not isinstance(page, dict) or not isinstance(page.get("tools"), list):
                 raise HomeAssistantError("invalid_tool_catalog")
             for tool in page["tools"]:
-                if not isinstance(tool, dict) or tool.get("name") not in ASSIST_TOOLS:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
                     continue
                 name = tool["name"]
+                if name not in ASSIST_TOOLS and name not in self._scripts:
+                    continue
                 schema = tool.get("inputSchema")
                 if not isinstance(schema, dict) or schema.get("type") != "object":
                     raise HomeAssistantError("invalid_tool_catalog")
@@ -348,7 +403,15 @@ class HomeAssistantTools:
                 description = tool.get("description", "Home Assistant Assist device tool.")
                 if not isinstance(description, str):
                     raise HomeAssistantError("invalid_tool_catalog")
-                tools["ha_" + name] = {"type": "function", "name": "ha_" + name,
+                alias = "ha_" + name if name in ASSIST_TOOLS else "ha_script_" + name
+                if alias.startswith("ha_script_"):
+                    description = ("Runs a Home Assistant script. Use for requests to run this script. "
+                                   "If the user explicitly asks for a scene, use the scene tool path instead. "
+                                   + description)
+                elif name == "HassTurnOn":
+                    description = ("Also activates a Home Assistant scene. For a named scene, supply the exact "
+                                   "scene name and domain [\"scene\"]. " + description)
+                tools[alias] = {"type": "function", "name": alias,
                     "description": description[:4000], "parameters": copy.deepcopy(schema), "strict": False}
             cursor = page.get("nextCursor")
             if not cursor:
@@ -359,12 +422,204 @@ class HomeAssistantTools:
             raise HomeAssistantError("tool_catalog_too_large")
         if not tools:
             raise HomeAssistantError("no_exposed_assist_tools")
+        if self._cache_path and "ha_GetLiveContext" in tools:
+            tools[SAVE_ALIAS_TOOL] = {
+                "type": "function", "name": SAVE_ALIAS_TOOL, "strict": False,
+                "description": ("Saves a persistent StackChan alias only when the user explicitly asks to save it. "
+                                "No device action. Supply the exact Home Assistant target name. Use replace only "
+                                "if the user explicitly asks to change an existing alias."),
+                "parameters": {"type": "object", "properties": {
+                    "alias": {"type": "string"}, "target": {"type": "string"},
+                    "area": {"type": "string"},
+                    "domain": {"type": "string", "enum": sorted(TARGET_DOMAINS)},
+                    "replace": {"type": "boolean"},
+                }, "required": ["alias", "target"], "additionalProperties": False},
+            }
         self._tools = tools
+        if self._cache_path:
+            self._targets, self._aliases = await asyncio.to_thread(self._load_targets)
 
     def definitions(self) -> list[dict[str, Any]]:
         return copy.deepcopy(list(self._tools.values()))
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _target_key(entry: dict[str, Any]) -> tuple[str, ...]:
+        return entry["tool"], entry["name"].casefold(), (entry["area"] or "").casefold(), entry["domain"]
+
+    def _load_targets(self) -> tuple[dict[tuple[str, ...], dict[str, Any]], dict[str, dict[str, Any]]]:
+        path = self._cache_path
+        if path.is_symlink():
+            return {}, {}
+        try:
+            with path.open("rb") as source:
+                data = json.loads(source.read(131072))
+        except (OSError, ValueError):
+            return {}, {}
+        if not isinstance(data, dict) or data.get("home") != self._cache_home:
+            return {}, {}
+        targets = {}
+        for entry in data.get("targets", [])[-TARGET_CACHE_LIMIT:] if isinstance(data.get("targets"), list) else ():
+            if (isinstance(entry, dict) and set(entry) == {"tool", "name", "area", "domain", "expires"}
+                    and isinstance(entry["tool"], str) and entry["tool"] in self._tools
+                    and isinstance(entry["domain"], str) and entry["domain"] in TARGET_DOMAINS
+                    and _target_label(entry["name"]) and (entry["area"] is None or _target_label(entry["area"]))
+                    and type(entry["expires"]) is int and time.time() < entry["expires"] <= time.time() + TARGET_CACHE_TTL):
+                targets[self._target_key(entry)] = entry
+        aliases = {}
+        entries = data.get("aliases", [])
+        for entry in entries[:ALIAS_LIMIT] if isinstance(entries, list) else ():
+            if (isinstance(entry, dict) and set(entry) == {"alias", "name", "area", "domain"}
+                    and (key := _alias_key(entry["alias"])) is not None and _target_label(entry["name"])
+                    and (entry["area"] is None or _target_label(entry["area"]))
+                    and isinstance(entry["domain"], str) and entry["domain"] in TARGET_DOMAINS):
+                aliases[key] = entry
+        return targets, aliases
+
+    def saved_aliases(self) -> list[dict[str, Any]]:
+        return [entry.copy() for entry in self._aliases.values()]
+
+    async def _persist_cache(self, aliases: dict[str, dict[str, Any]]) -> None:
+        await _finish_thread(_save_private_json, self._cache_path, {
+            "home": self._cache_home, "targets": list(self._targets.values()), "aliases": list(aliases.values()),
+        })
+
+    def cached_targets(self) -> list[dict[str, Any]]:
+        now = time.time()
+        return [{key: entry[key] for key in ("tool", "name", "area", "domain")}
+                for entry in self._targets.values() if entry["expires"] > now and entry["tool"] in self._tools]
+
+    async def _update_targets(self, *, entry: dict[str, Any] | None = None,
+                              remove: tuple[str, str | None] | None = None) -> None:
+        if not self._cache_path:
+            return
+        async with self._cache_lock:
+            now = time.time()
+            targets = {key: value for key, value in self._targets.items() if value["expires"] > now}
+            if entry is not None:
+                key = self._target_key(entry)
+                targets.pop(key, None)
+                targets[key] = {**entry, "expires": int(now) + TARGET_CACHE_TTL}
+                if len(targets) > TARGET_CACHE_LIMIT:
+                    del targets[next(iter(targets))]
+            elif remove is not None:
+                name, area = remove
+                targets = {key: value for key, value in targets.items()
+                           if key[1] != name.casefold() or (area is not None and key[2] != area.casefold())}
+            if targets != self._targets:
+                self._targets = targets
+                try:
+                    await self._persist_cache(self._aliases)
+                except HomeAssistantError:
+                    pass  # The live call succeeded even if the optional cache file cannot be written.
+
+    def _confirmed_target(self, name: str, arguments: dict[str, Any], response: Any) -> dict[str, Any] | None:
+        if name.startswith("ha_script_"):
+            label = name.removeprefix("ha_script_").replace("_", " ")
+            return {"tool": name, "name": label, "area": None, "domain": "script"} if _target_label(label) else None
+        if not isinstance(response, dict) or response.get("response_type") != "action_done":
+            return None
+        data = response.get("data")
+        success = data.get("success") if isinstance(data, dict) else None
+        if not isinstance(success, list) or len(success) != 1 or not isinstance(success[0], dict):
+            return None
+        if success[0].get("type") != "entity":
+            return None
+        entity = success[0].get("id")
+        domain = entity.split(".", 1)[0] if isinstance(entity, str) and "." in entity else ""
+        label = _target_label(arguments.get("name"))
+        area = _target_label(arguments.get("area"))
+        if label and domain in TARGET_DOMAINS and (arguments.get("area") is None or area):
+            return {"tool": name, "name": label, "area": area, "domain": domain}
+        return None
+
+    async def _save_alias(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        alias = _alias_key(arguments.get("alias"))
+        target = _target_label(arguments.get("target"))
+        area = _target_label(arguments.get("area"))
+        domain = arguments.get("domain")
+        replace = arguments.get("replace", False)
+        if (not alias or not target or (arguments.get("area") is not None and not area)
+                or (domain is not None and (not isinstance(domain, str) or domain not in TARGET_DOMAINS))
+                or not isinstance(replace, bool) or set(arguments) - {"alias", "target", "area", "domain", "replace"}):
+            return {"ok": False, "error": "invalid_alias"}
+        if domain == "script":
+            script = "ha_script_" + re.sub(r"[ -]+", "_", target.casefold())
+            if area or script not in self._tools:
+                return {"ok": False, "error": "alias_target_unavailable"}
+            target = script.removeprefix("ha_script_")
+        else:
+            query = {"name": target}
+            if area:
+                query["area"] = area
+            if domain:
+                query["domain"] = domain
+            result = await self.execute("ha_GetLiveContext", query, _resolve_alias=False)
+            if not result.get("ok"):
+                return result
+            context = result.get("text", "")
+            domains = re.findall(r"^  domain: ([a-z_]+)$", context, re.M)
+            if (result.get("truncated") or len(re.findall(r"^- names:", context, re.M)) != 1
+                    or len(domains) != 1 or domains[0] not in TARGET_DOMAINS - {"script"}
+                    or (domain and domain != domains[0])):
+                return {"ok": False, "error": "alias_target_ambiguous",
+                        "feedback": "Kies één vrijgegeven doel. Geef zo nodig ook het soort en de ruimte."}
+            domain = domains[0]
+            target = result.get("resolved_name", target)
+            rooms = re.findall(r"^  areas: (.+)$", context, re.M)
+            if not area and len(rooms) == 1 and "," not in rooms[0]:
+                area = _target_label(rooms[0])
+        entry = {"alias": alias, "name": target, "area": area, "domain": domain}
+        async with self._cache_lock:
+            previous = self._aliases.get(alias)
+            if previous and previous != entry and not replace:
+                return {"ok": False, "error": "alias_already_exists", "current_alias": previous}
+            if not previous and len(self._aliases) >= ALIAS_LIMIT:
+                return {"ok": False, "error": "alias_limit_reached"}
+            if previous != entry:
+                aliases = {**self._aliases, alias: entry}
+                try:
+                    await self._persist_cache(aliases)
+                except asyncio.CancelledError:
+                    self._targets, self._aliases = await asyncio.to_thread(self._load_targets)
+                    raise
+                except HomeAssistantError:
+                    return {"ok": False, "error": "alias_save_failed"}
+                self._aliases = aliases
+        return {"ok": True, "saved_alias": entry}
+
+    async def _execute_alias(self, tool: str, arguments: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+        name, area, domain = entry["name"], entry["area"], entry["domain"]
+        requested_area = arguments.get("area")
+        if (arguments.get("domain") not in (None, domain, [domain])
+                or (requested_area is not None and (not isinstance(requested_area, str)
+                    or (area and requested_area.casefold() != area.casefold())))):
+            return {"ok": False, "error": "alias_scope_mismatch", "saved_alias": entry}
+        if domain == "script":
+            if tool == "ha_HassTurnOn" and set(arguments) <= {"name", "domain"}:
+                result = await self.execute("ha_script_" + name, {})
+            else:
+                return {"ok": False, "error": "use_script_tool", "script_tool": "ha_script_" + name}
+        else:
+            properties = self._tools[tool]["parameters"].get("properties", {})
+            if "domain" not in properties:
+                intrinsic_domain = {
+                    "ha_HassLightSet": "light",
+                    "ha_HassClimateSetTemperature": "climate",
+                    "ha_HassFanSetSpeed": "fan",
+                    "ha_HassSetVolume": "media_player",
+                }.get(tool, "media_player" if tool.startswith("ha_HassMedia") else None)
+                if intrinsic_domain != domain:
+                    return {"ok": False, "error": "alias_scope_mismatch", "saved_alias": entry}
+            rewritten = {**arguments, "name": name}
+            if "domain" in properties:
+                rewritten["domain"] = [domain] if properties["domain"].get("type") == "array" else domain
+            if area and "area" in properties:
+                rewritten["area"] = area
+            result = await self.execute(tool, rewritten, _suffix_fallback=False, _resolve_alias=False)
+        return {**result, "resolved_name": name, "resolved_domain": domain}
+
+    async def execute(self, name: str, arguments: dict[str, Any], *, _suffix_fallback: bool = True,
+                      _resolve_alias: bool = True) -> dict[str, Any]:
         if name not in self._tools:
             return {"ok": False, "error": "unknown_home_assistant_tool"}
         try:
@@ -372,15 +627,25 @@ class HomeAssistantTools:
                 return {"ok": False, "error": "invalid_tool_arguments"}
             if len(json.dumps(arguments, allow_nan=False).encode()) > MAX_ARGUMENTS:
                 return {"ok": False, "error": "invalid_tool_arguments"}
-            result = await self._rpc("tools/call", {"name": name[3:], "arguments": arguments})
+            if name == SAVE_ALIAS_TOOL:
+                return await self._save_alias(arguments)
+            if _resolve_alias and not name.startswith("ha_script_"):
+                alias = self._aliases.get(_alias_key(arguments.get("name")))
+                if alias:
+                    return await self._execute_alias(name, arguments, alias)
+            prefix = "ha_script_" if name.startswith("ha_script_") else "ha_"
+            result = await self._rpc("tools/call", {"name": name[len(prefix):], "arguments": arguments})
             if not isinstance(result, dict):
                 return {"ok": False, "error": "home_assistant_tool_failed"}
             content = result.get("content", [])
             if not isinstance(content, list):
                 return {"ok": False, "error": "invalid_tool_result"}
             structured = result.get("structuredContent")
-            failure = _semantic_failure(structured) or ("home_assistant_tool_failed" if result.get("isError") else None)
-            detail = error_detail(structured)
+            structured_payload = _tool_payload(structured)
+            confirmed = self._confirmed_target(name, arguments, structured_payload) if self._cache_path else None
+            failure = (_semantic_failure(structured) or _semantic_failure(structured_payload)
+                       or ("home_assistant_tool_failed" if result.get("isError") else None))
+            detail = error_detail(structured) or error_detail(structured_payload)
             rendered: list[str] = []
             omitted_json = False
             for item in content:
@@ -392,8 +657,11 @@ class HomeAssistantTools:
                             detail = diagnostic_text(item["text"])
                         rendered.append(item["text"])
                         continue
-                    failure = failure or _semantic_failure(decoded)
-                    detail = detail or error_detail(decoded)
+                    payload = _tool_payload(decoded)
+                    failure = failure or _semantic_failure(decoded) or _semantic_failure(payload)
+                    detail = detail or error_detail(decoded) or error_detail(payload)
+                    if self._cache_path and confirmed is None:
+                        confirmed = self._confirmed_target(name, arguments, payload)
                     # GetLiveContext returns JSON containing a large YAML/text
                     # result. Decode the complete envelope before shortening
                     # the actual context; never send half a JSON document.
@@ -405,6 +673,7 @@ class HomeAssistantTools:
                         omitted_json = True
             if failure:
                 output = {"ok": False, "error": failure}
+                match = None
                 if detail:
                     output["ha_detail"] = detail
                     match = re.search(r"MatchFailedReason\.(NAME|AREA)\b|No exposed entities matched (name|area)\b", detail, re.I)
@@ -412,6 +681,15 @@ class HomeAssistantTools:
                         field = (match[1] or match[2]).lower()
                         label = "apparaatnaam" if field == "name" else "ruimte"
                         output["feedback"] = f"Home Assistant vond geen overeenkomst voor de opgegeven {label}."
+                        if name == "ha_GetLiveContext" and field == "name" and _suffix_fallback:
+                            shortened = _lookup_without_suffix(arguments)
+                            if shortened:
+                                retry = await self.execute(name, shortened, _suffix_fallback=False, _resolve_alias=_resolve_alias)
+                                if retry.get("ok"):
+                                    return {**retry, "resolved_name": shortened["name"],
+                                            "resolved_domain": shortened["domain"]}
+                    if (match or detail == "no_valid_targets") and (target := _target_label(arguments.get("name"))):
+                        await self._update_targets(remove=(target, _target_label(arguments.get("area"))))
                 return output
             text = "\n".join(rendered)
             output: dict[str, Any] = {"ok": True, "text": text[:MAX_OUTPUT]}
@@ -421,6 +699,9 @@ class HomeAssistantTools:
                                   "met name, area of domain voor het bedoelde apparaat. Herhaal geen bedieningsactie.")
             if isinstance(structured, dict) and len(json.dumps(structured, allow_nan=False)) + len(text) < MAX_OUTPUT:
                 output["data"] = structured
+            if confirmed:
+                await self._update_targets(entry=confirmed)
+                output["confirmed_target"] = confirmed
             return output
         except HomeAssistantError as error:
             return {"ok": False, "error": str(error), **({"ha_detail": error.detail} if error.detail else {})}

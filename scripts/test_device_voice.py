@@ -94,7 +94,10 @@ def run(args, pcm):
                 before = wait(dev, 30, prompt_accepted, in_session=True)
                 # Count both received output and acoustic energy on the physical
                 # microphone while the actual assistant PCM is playing.
+                listening_peak = 0
                 def answered(d):
+                    nonlocal listening_peak
+                    listening_peak = max(listening_peak, d.get("listening_wave_height_px", 0))
                     t, prev = d["voice_test"], before["voice_test"]
                     return (not t["prompt_playing"] and t["prompt_mic_frames"]-prev["prompt_mic_frames"] >= 6
                             and t["voiced_reply_frames"]-prev["voiced_reply_frames"] >= 35
@@ -108,11 +111,13 @@ def run(args, pcm):
                     print("De microfoonverbinding meldt 3,2 seconden een volle zendbuffer.", flush=True)
                 last = reply["voice_test"]["voiced_reply_frames"]
                 quiet_since = time.monotonic()
+                speech_tail_seen = False
                 def finished(d):
-                    nonlocal last, quiet_since
+                    nonlocal last, quiet_since, speech_tail_seen
                     voiced = d["voice_test"]["voiced_reply_frames"]
                     if d["speaking"] or voiced != last:
                         quiet_since = time.monotonic()
+                    speech_tail_seen |= bool(d.get("display_speaking") and not d["speaking"])
                     last = voiced
                     return time.monotonic()-quiet_since >= 1.6
                 after = wait(dev, 35, finished, in_session=True)
@@ -121,6 +126,14 @@ def run(args, pcm):
                               "prompt_mic_frames": after["voice_test"]["prompt_mic_frames"]-before["voice_test"]["prompt_mic_frames"],
                               "reply_mic_frames": after["voice_test"]["reply_mic_frames"]-before["voice_test"]["reply_mic_frames"],
                               "gestures": after["head"]["count"]-before["head"]["count"]})
+                if args.wave:
+                    for name in ("listening_wave_frames", "speaking_wave_frames"):
+                        turns[-1][name] = after[name] - before[name]
+                    if "listening_wave_height_px" in after:
+                        turns[-1]["listening_peak_half_height_px"] = listening_peak
+                    if "display_speaking" in after:
+                        turns[-1]["speech_tail_seen"] = speech_tail_seen
+                        turns[-1]["returned_to_listening"] = not after["display_speaking"]
                 print(turns[-1], flush=True)
             final = wait(dev, args.seconds+3, lambda d: time.monotonic()-began >= args.seconds, in_session=True)
             duration = round(time.monotonic()-began, 1)
@@ -128,6 +141,8 @@ def run(args, pcm):
             if dev.diag()["voice_test"]["active"]:
                 dev.command(b"TEST.STOP")
         closed = wait(dev, 12, lambda d: not d["active"] and not d["session_closing"])
+        if args.wave:
+            wait(dev, 3, lambda d: d["state"] == "Gesprek gestopt" and d["controls_visible"])
     with BRIDGE_LOG.open("rb") as log:
         log.seek(offset)
         events = [json.loads(line.split(b" ", 1)[1]) for line in log if b' {"' in line]
@@ -152,6 +167,11 @@ def run(args, pcm):
             or end["input_overflows"] or end["output_overflows"] or not end["usage_confirmed"]
             or closed["last_stop"] != "user_stop" or end["reason"] != "user_stop"):
         raise RuntimeError("Een of meer controles op audio, beweging of afsluiting zijn mislukt")
+    if args.wave and any(min(turn["listening_wave_frames"], turn["speaking_wave_frames"]) < 10 for turn in turns):
+        raise RuntimeError("De luistergolf of spraakgolf is onvoldoende bijgewerkt")
+    if args.wave and "display_speaking" in final:
+        if not any(turn["speech_tail_seen"] for turn in turns) or not all(turn["returned_to_listening"] for turn in turns):
+            raise RuntimeError("Het vasthouden of loslaten van de spreekweergave is niet gemeten")
 
 
 if __name__ == "__main__":
@@ -166,6 +186,7 @@ if __name__ == "__main__":
                        help="Voeg eenmaal een netwerkpauze van 650 ms toe tijdens een antwoord")
     stall.add_argument("--stall-ms", type=int, choices=(650, 1550), default=0)
     ap.add_argument("--tx-busy", action="store_true", help="Simuleer een volle TCP-zendbuffer gedurende 3,2 s")
+    ap.add_argument("--wave", action="store_true", help="Controleer de luistergolf en spraakgolf tijdens elke beurt")
     args = ap.parse_args()
     if not 15 <= args.seconds <= 130 or not 1 <= args.turns <= 4:
         ap.error("Kies 15–130 seconden en 1–4 vragen")

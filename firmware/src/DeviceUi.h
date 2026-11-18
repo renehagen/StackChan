@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <freertos/FreeRTOS.h>
@@ -24,7 +25,6 @@ struct UiSnapshot {
   bool connected = false;
   bool wifiConnected = false;
   uint8_t volume = 90;
-  uint16_t mouthLevel = 0;
   bool speaking = false;
   char status[80]{};
 };
@@ -38,13 +38,18 @@ class DeviceUi {
  public:
   using ImmediateHandler = void (*)(UiCommand, const UiSnapshot&);
 
-  DeviceUi() = default;
+  explicit DeviceUi(const std::atomic<uint32_t>& speakingUntil) : speakingUntil_(speakingUntil) {}
   DeviceUi(const DeviceUi&) = delete;
   DeviceUi& operator=(const DeviceUi&) = delete;
 
   bool begin();
   void publish(const UiSnapshot& snapshot);
   bool pollCommand(UiCommand& command);
+  void observeMic(uint32_t level);
+  void observeSpeaker(uint32_t level);
+  uint32_t listeningWaveFrames() const { return listeningWaveFrames_.load(std::memory_order_relaxed); }
+  int listeningWaveHeight() const { return paintedWaveHeight_.load(std::memory_order_relaxed); }
+  uint32_t speakingWaveFrames() const { return speakingWaveFrames_.load(std::memory_order_relaxed); }
   bool controlsVisible() const { return controlsVisible_.load(); }
   uint8_t panelButtonMask() const { return panelButtonMask_.load(); }
   bool ready() const { return ready_.load(std::memory_order_acquire); }
@@ -61,8 +66,21 @@ class DeviceUi {
   static void taskEntry(void* context);
   void run();
   void handleTouch(const UiSnapshot& snapshot);
-  void render(const UiSnapshot& snapshot, uint8_t eyeFrame, uint8_t mouthFrame);
+  void render(const UiSnapshot& snapshot, uint32_t now);
   void releaseBeforeTask();
+
+  enum class WaveMode : uint8_t { Idle, Listening, Speaking, Muted };
+  const std::atomic<uint32_t>& speakingUntil_;
+  std::atomic<uint32_t> micPeak_{0}, speakerPeak_{0};
+  std::atomic<uint32_t> listeningWaveFrames_{0}, speakingWaveFrames_{0};
+  std::array<uint8_t, 23> waveHistory_{};
+  WaveMode waveMode_ = WaveMode::Idle;
+  uint32_t waveSampleAt_ = 0;
+  uint32_t waveWindowPeak_ = 0;
+  std::atomic<int> paintedWaveHeight_{0};
+  int speechLevel_ = 0;
+  uint32_t speechUpdatedAt_ = 0;
+  int paintedSpeechUnit_ = 0, paintedSpeechPairs_ = 0;
 
   m5gfx::M5Canvas* canvas_ = nullptr;
   void* pixels_ = nullptr;
@@ -80,8 +98,6 @@ class DeviceUi {
   uint32_t controlsTouchedAt_ = 0;
   bool volumeOpen_ = false;
   bool paintedVolumeOpen_ = false;
-  uint8_t paintedEye_ = 0;
-  uint8_t paintedMouth_ = 0;
   uint32_t volumeTouchedAt_ = 0;
   uint32_t lastTouchAt_ = 0;
   bool hasAcceptedTouch_ = false;

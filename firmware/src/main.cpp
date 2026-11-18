@@ -36,7 +36,10 @@ class AudioWebSocket : public WebSocketsClient {
   }
 };
 AudioWebSocket audioSocket;
-DeviceUi ui;
+std::atomic<uint32_t> echoUntil{0};
+std::atomic<uint32_t> displaySpeechUntil{0};
+DeviceUi ui(displaySpeechUntil);
+constexpr uint32_t kDisplaySpeechTailMs = 900;
 QueueHandle_t captureQueue, playbackQueue;
 constexpr unsigned kCaptureFrames = 240, kPlaybackFrames = 200;
 StaticQueue_t captureControl{}, playbackControl{};
@@ -51,11 +54,9 @@ std::atomic<bool> active{false}, locallyMuted{false};
 std::atomic<bool> localInputHold{false}, localOutputHold{false};
 enum AudioFault : uint32_t { RxStall = 1, TxFailure = 2 };
 std::atomic<uint32_t> audioFaults{0};
-std::atomic<uint32_t> echoUntil{0};
 std::atomic<uint32_t> rxSamples{0}, txSamples{0}, audioFailures{0};
 std::atomic<uint32_t> captureOverflows{0}, playbackOverflows{0}, playbackUnderruns{0}, readTimeouts{0};
 std::atomic<uint32_t> captureQueueHigh{0}, playbackQueueHigh{0};
-std::atomic<uint16_t> mouthLevel{0};
 std::atomic<uint8_t> volume{90};
 uint32_t netInputFrames = 0, netOutputFrames = 0, loopMaxMs = 0, sendMaxMs = 0;
 uint32_t sendStalls = 0, recvServiceMaxMs = 0;
@@ -129,7 +130,13 @@ void captureTask(void*) {
     const bool echoGuard = static_cast<int32_t>(echoUntil.load() - millis()) > 0;
     if (voiceTest::enabled()) voiceTest::measureMic(frame, echoGuard);
     // Continuous, paced silence preserves the Live audio clock while muted.
-    if (locallyMuted.load() || localInputHold.load() || echoGuard) memset(frame.samples, 0, sizeof(frame.samples));
+    if (locallyMuted.load() || localInputHold.load() || echoGuard) {
+      memset(frame.samples, 0, sizeof(frame.samples));
+    } else {
+      uint32_t magnitude = 0;
+      for (int16_t sample : frame.samples) magnitude += abs(static_cast<int32_t>(sample));
+      ui.observeMic(magnitude / frame.count);
+    }
     if (xQueueSend(captureQueue, &frame, 0) != pdTRUE) {
       AudioFrame stale;
       xQueueReceive(captureQueue, &stale, 0);
@@ -179,8 +186,14 @@ void playbackTask(void*) {
       } else if (++resumedFrames >= 3) gapSince = 0;
     }
     if (level > 180) lastVoiced = millis();
-    mouthLevel = volume.load() ? level : 0;
-    if (level > 180 && volume.load()) echoUntil = millis() + 260;
+    if (volume.load()) {
+      if (level > 180) {
+        const uint32_t now = millis();
+        echoUntil = now + 260;
+        displaySpeechUntil.store(now + kDisplaySpeechTailMs, std::memory_order_relaxed);
+      }
+      ui.observeSpeaker(level);
+    }
     // The fixture is acoustic input. Let the real mic hear it. Ordinary
     // assistant playback still receives the existing echo guard above.
     if (active.load() && !localOutputHold.load() && voiceTest::enabled()) {
@@ -197,7 +210,8 @@ void playbackTask(void*) {
 
 void clearAudio() {
   active = false;
-  mouthLevel = 0;
+  echoUntil = 0;
+  displaySpeechUntil = 0;
   if (captureQueue) xQueueReset(captureQueue);
   if (playbackQueue) xQueueReset(playbackQueue);
 }
@@ -210,7 +224,7 @@ void sendControl(const char* type) {
   audioSocket.sendTXT(json);
 }
 
-void stopConversation(const char* message, const char* reason = "user_stop") {
+void stopConversation(const char* message, const char* reason = "user_stop", bool notifyBridge = true) {
   voiceTest::stop();
   const bool wasSession = active.load() || starting;
   clearAudio();
@@ -221,6 +235,7 @@ void stopConversation(const char* message, const char* reason = "user_stop") {
   if (connected && wasSession && !closing) {
     closing = true;
     operationSince = millis();
+    if (!notifyBridge) return;
     JsonDocument doc;
     doc["type"] = "stop";
     doc["reason"] = reason;
@@ -228,6 +243,66 @@ void stopConversation(const char* message, const char* reason = "user_stop") {
     serializeJson(doc, payload);
     audioSocket.sendTXT(payload);
   }
+}
+
+void setDeviceVolume(int percent) {
+  const int value = std::max(0, std::min(100, percent));
+  if (volume.load() == value) return;
+  volume = value;
+  audio.setVolume(value);
+  volumeChangedAt = millis();
+  volumeDirty = true;
+}
+
+bool requestMute(bool muted) {
+  if (!active.load() || closing) return false;
+  if (mutePending) return requestedMuteState == muted;
+  if (locallyMuted.load() == muted) return true;
+  if (muted) {
+    locallyMuted = true;
+    localInputHold = true;
+  }
+  requestedMuteState = muted;
+  mutePending = true;
+  muteSince = millis();
+  xQueueReset(captureQueue);
+  JsonDocument doc;
+  doc["type"] = "mute";
+  doc["muted"] = muted;
+  String json;
+  serializeJson(doc, json);
+  audioSocket.sendTXT(json);
+  status = muted ? "Microfoon gedempt" : "Microfoon inschakelen...";
+  return true;
+}
+
+void handleVoiceControl(const JsonDocument& doc) {
+  if (!doc["id"].is<uint32_t>()) return;
+  const String action = doc["action"] | "";
+  bool accepted = false;
+  if (active.load() && !closing) {
+    if (action == "stop") {
+      localInputHold = localOutputHold = true;
+      stopConversation("Gesprek stoppen...", "user_stop", false);
+      return;  // The bridge is already finalizing this session.
+    }
+    if (action == "volume" && doc["percent"].is<int>()) {
+      const int percent = doc["percent"].as<int>();
+      if (percent >= 0 && percent <= 100) {
+        setDeviceVolume(percent);
+        accepted = true;
+      }
+    } else if (action == "mute") {
+      accepted = requestMute(true);
+    }
+  }
+  JsonDocument ack;
+  ack["type"] = "voice_control_ack";
+  ack["id"] = doc["id"].as<uint32_t>();
+  ack["ok"] = accepted;
+  String payload;
+  serializeJson(ack, payload);
+  audioSocket.sendTXT(payload);
 }
 
 void onSocket(WStype_t event, uint8_t* data, size_t length) {
@@ -309,6 +384,8 @@ void onSocket(WStype_t event, uint8_t* data, size_t length) {
         const String code = doc["code"] | "unknown";
         lastBridgeError = safeString(code) ? code.substring(0, 64) : "invalid_error";
         stopConversation("Verbindingsfout - probeer opnieuw", "bridge_error");
+      } else if (type == "voice_control") {
+        handleVoiceControl(doc);
       } else if (type == "muted") {
         const bool muted = doc["muted"] | true;
         if (!active.load() || !mutePending || muted != requestedMuteState) break;
@@ -357,12 +434,7 @@ void handleUiCommands() {
   UiCommand command;
   while (ui.pollCommand(command)) {
     if (command == UiCommand::VolumeDown || command == UiCommand::VolumeUp) {
-      int value = volume.load() + (command == UiCommand::VolumeUp ? 10 : -10);
-      value = std::max(0, std::min(100, value));
-      volume = value;
-      audio.setVolume(value);
-      volumeChangedAt = millis();
-      volumeDirty = true;
+      setDeviceVolume(volume.load() + (command == UiCommand::VolumeUp ? 10 : -10));
       continue;
     }
     if (command == UiCommand::StopSession) {
@@ -371,21 +443,8 @@ void handleUiCommands() {
       }
     } else if (command == UiCommand::StartSession) {
       startConversation();
-    } else if ((command == UiCommand::Mute || command == UiCommand::Unmute) && active.load() && !mutePending) {
-      const bool requestedMute = command == UiCommand::Mute;
-      if (locallyMuted.load() == requestedMute) continue;
-      if (requestedMute) locallyMuted = true;
-      requestedMuteState = requestedMute;
-      mutePending = true;
-      muteSince = millis();
-      xQueueReset(captureQueue);
-      JsonDocument doc;
-      doc["type"] = "mute";
-      doc["muted"] = requestedMute;
-      String json;
-      serializeJson(doc, json);
-      audioSocket.sendTXT(json);
-      status = requestedMute ? "Microfoon gedempt" : "Microfoon inschakelen...";
+    } else if (command == UiCommand::Mute || command == UiCommand::Unmute) {
+      requestMute(command == UiCommand::Mute);
     }
   }
   // Avoid flash writes while the audio stream is active.
@@ -410,12 +469,7 @@ void publishUi() {
   snapshot.connected = connected;
   snapshot.wifiConnected = WiFi.status() == WL_CONNECTED;
   snapshot.volume = volume.load();
-  snapshot.mouthLevel = mouthLevel.load();
-  snapshot.speaking = static_cast<int32_t>(echoUntil.load() - millis()) > 0;
-  String visible = status;
-  if (snapshot.active && !snapshot.muted && !mutePending)
-    visible = snapshot.speaking ? "Ik praat" : "Ik luister";
-  visible.toCharArray(snapshot.status, sizeof(snapshot.status));
+  status.toCharArray(snapshot.status, sizeof(snapshot.status));
   ui.publish(snapshot);
 }
 
@@ -527,13 +581,20 @@ void handleSerial() {
         diag["wifi_connected"] = WiFi.status() == WL_CONNECTED;
         diag["bridge_connected"] = connected;
         diag["active"] = active.load();
+        diag["mic_muted"] = locallyMuted.load();
+        diag["mute_pending"] = mutePending;
         diag["free_heap"] = ESP.getFreeHeap();
         diag["ui_ready"] = ui.ready();
+        diag["listening_wave_frames"] = ui.listeningWaveFrames();
+        diag["listening_wave_height_px"] = ui.listeningWaveHeight();
+        diag["speaking_wave_frames"] = ui.speakingWaveFrames();
         head::diagnostics(diag["head"].to<JsonObject>());
         voiceTest::diagnostics(diag["voice_test"].to<JsonObject>());
         diag["paired_pcm"] = pairedPcm;
         diag["prebuffer_frames"] = prebufferFrames.load();
         diag["speaking"] = static_cast<int32_t>(echoUntil.load()-millis()) > 0;
+        diag["display_speaking"] = active.load() && volume.load() &&
+            static_cast<int32_t>(displaySpeechUntil.load() - millis()) > 0;
         diag["session_closing"] = closing;
         diag["free_psram"] = ESP.getFreePsram();
         diag["last_stop"] = lastStop;
@@ -637,7 +698,8 @@ void maintainNetwork() {
     return; // certificate validation is never disabled
   }
   if (!socketStarted) {
-    authHeader = "Authorization: Bearer " + cfg.token + "\r\nX-StackChan-Audio: pcm-pair-v1";
+    authHeader = "Authorization: Bearer " + cfg.token +
+        "\r\nX-StackChan-Audio: pcm-pair-v1\r\nX-StackChan-Controls: voice-v1";
     audioSocket.beginSslWithCA(cfg.host.c_str(), cfg.port, "/device", cfg.ca.c_str(), "");
     audioSocket.setExtraHeaders(authHeader.c_str());
     audioSocket.onEvent(onSocket);
@@ -719,7 +781,7 @@ void setup() {
     return static_cast<int32_t>(echoUntil.load() - millis()) > 0 ?
         head::State::Speaking : head::State::Listening;
   });
-  Serial.println("STACKCHAN_READY v9");
+  Serial.println("STACKCHAN_READY v15");
 }
 
 void loop() {

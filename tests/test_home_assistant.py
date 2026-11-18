@@ -98,6 +98,136 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"ok": True, "text": "Lamp is on"})
         self.assertEqual(self.fake.calls, [{"name": "HassTurnOn", "arguments": {"name": "living room"}}])
 
+    async def test_only_selected_available_scripts_are_routed(self):
+        self.client = HomeAssistantTools(self.path, scripts=("woonkamer_warm", "missing_script"))
+        self.client._opener = self.fake
+        for name in ("woonkamer_warm", "other_script"):
+            self.fake.catalog.append({"name": name, "description": f"Aliases: ['{name}']",
+                                      "inputSchema": {"type": "object", "properties": {}}})
+        await self.client.initialize()
+        names = {tool["name"] for tool in self.client.definitions()}
+        self.assertEqual(names, {"ha_GetLiveContext", "ha_HassTurnOn", "ha_script_woonkamer_warm"})
+        for name in ("ha_script_other_script", "ha_script_missing_script", "ha_woonkamer_warm"):
+            self.assertFalse((await self.client.execute(name, {}))["ok"])
+        self.assertTrue((await self.client.execute("ha_script_woonkamer_warm", {}))["ok"])
+        self.assertEqual(self.fake.calls, [{"name": "woonkamer_warm", "arguments": {}}])
+
+    async def test_cache_persists_confirmed_targets_and_evicts_a_name_failure(self):
+        from bridge.stackchan_bridge import Config
+
+        cache = Path(self.tmp.name) / "targets.json"
+        client = HomeAssistantTools(self.path, cache_path=cache)
+        client._opener = self.fake
+        await client.initialize()
+        result = {"response_type": "action_done", "data": {
+            "success": [{"id": "light.test_light", "name": "Testlamp", "type": "entity"}], "failed": [],
+        }}
+        async def completed(*args):
+            return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": result})}]}
+        client._rpc = completed
+        arguments = {"name": "Testlamp", "area": "Woonkamer", "domain": ["light"], "brightness": 100}
+        response = await client.execute("ha_HassTurnOn", arguments)
+        expected = {"tool": "ha_HassTurnOn", "name": "Testlamp", "area": "Woonkamer", "domain": "light"}
+        self.assertEqual(response["confirmed_target"], expected)
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("brightness", cache.read_text())
+
+        restarted = HomeAssistantTools(self.path, cache_path=cache)
+        restarted._opener = self.fake
+        await restarted.initialize()
+        self.assertEqual(restarted.cached_targets(), [expected])
+        config = Config(api_key="local-test", device_token="a" * 40, tool_handler=restarted)
+        self.assertIn("Testlamp", config.start_event()["session"]["delegation"]["responses"]["instructions"])
+
+        async def missing(*args):
+            return {"isError": True, "content": [{"type": "text", "text": "MatchFailedReason.NAME"}]}
+        restarted._rpc = missing
+        self.assertFalse((await restarted.execute("ha_HassTurnOn", arguments))["ok"])
+        self.assertEqual(restarted.cached_targets(), [])
+        self.assertNotIn("Testlamp", config.start_event()["session"]["delegation"]["responses"]["instructions"])
+
+    async def test_cache_skips_partial_or_multi_target_actions_and_remembers_scripts(self):
+        cache = Path(self.tmp.name) / "targets.json"
+        self.fake.catalog.append({"name": "woonkamer_warm", "inputSchema": {"type": "object"}})
+        client = HomeAssistantTools(self.path, scripts=("woonkamer_warm",), cache_path=cache)
+        client._opener = self.fake
+        await client.initialize()
+        result = {"response_type": "action_done", "data": {
+            "success": [{"id": "light.one", "type": "entity"}, {"id": "light.two", "type": "entity"}], "failed": [],
+        }}
+        async def completed(*args):
+            return {"structuredContent": result}
+        client._rpc = completed
+        await client.execute("ha_HassTurnOn", {"name": "Testlamp"})
+        self.assertEqual(client.cached_targets(), [])
+        result["data"]["success"].pop()
+        result["data"]["failed"].append({"id": "light.two"})
+        await client.execute("ha_HassTurnOn", {"name": "Testlamp"})
+        self.assertEqual(client.cached_targets(), [])
+        async def empty(*args):
+            return {"content": [], "isError": False}
+        client._rpc = empty
+        await client.execute("ha_script_woonkamer_warm", {})
+        self.assertEqual(client.cached_targets()[0]["domain"], "script")
+
+    async def test_saved_alias_uses_verified_target_and_survives_restart(self):
+        path = Path(self.tmp.name) / "targets.json"
+        for tool in self.fake.catalog:
+            if tool["name"] == "HassTurnOn":
+                tool["inputSchema"]["properties"].update({
+                    "domain": {"type": "array"}, "area": {"type": "string"},
+                })
+        client = HomeAssistantTools(self.path, cache_path=path)
+        client._opener = self.fake
+        await client.initialize()
+        lookups = []
+        async def lookup(method, params):
+            lookups.append(params)
+            context = '- names: 32" The Frame\n  domain: media_player\n  areas: Keuken\n'
+            return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": context})}]}
+        client._rpc = lookup
+        saved = await client.execute("ha_SaveAlias", {"alias": "TV 1", "target": '32" The Frame'})
+        self.assertEqual(saved["saved_alias"], {
+            "alias": "tv1", "name": '32" The Frame', "area": "Keuken", "domain": "media_player",
+        })
+        self.assertEqual(lookups, [{"name": "GetLiveContext", "arguments": {"name": '32" The Frame'}}])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+        restored = HomeAssistantTools(self.path, cache_path=path)
+        restored._opener = self.fake
+        await restored.initialize()
+        self.assertEqual(restored.saved_aliases(), [saved["saved_alias"]])
+        result = await restored.execute("ha_HassTurnOn", {"name": "Tv 1"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.fake.calls, [{"name": "HassTurnOn", "arguments": {
+            "name": '32" The Frame', "domain": ["media_player"], "area": "Keuken",
+        }}])
+        mismatch = await restored.execute("ha_HassTurnOn", {"name": "tv1", "domain": ["light"]})
+        self.assertEqual(mismatch["error"], "alias_scope_mismatch")
+        self.assertEqual(len(self.fake.calls), 1)
+
+    async def test_alias_refuses_ambiguous_target_and_implicit_replacement(self):
+        path = Path(self.tmp.name) / "targets.json"
+        client = HomeAssistantTools(self.path, cache_path=path)
+        client._opener = self.fake
+        await client.initialize()
+        async def lookup(method, params):
+            target = params["arguments"]["name"]
+            context = f"- names: {target}\n  domain: light\n"
+            if target == "Dubbel":
+                context += context
+            return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": context})}]}
+        client._rpc = lookup
+        self.assertEqual((await client.execute("ha_SaveAlias", {"alias": "a", "target": "Dubbel"}))["error"],
+                         "alias_target_ambiguous")
+        self.assertFalse(path.exists())
+        self.assertTrue((await client.execute("ha_SaveAlias", {"alias": "a", "target": "Een"}))["ok"])
+        self.assertEqual((await client.execute("ha_SaveAlias", {"alias": "A", "target": "Twee"}))["error"],
+                         "alias_already_exists")
+        self.assertEqual(client.saved_aliases()[0]["name"], "Een")
+        self.assertTrue((await client.execute("ha_SaveAlias", {"alias": "a", "target": "Twee", "replace": True}))["ok"])
+        self.assertEqual(client.saved_aliases()[0]["name"], "Twee")
+
     async def test_unknown_function_never_reaches_ha(self):
         await self.client.initialize()
         before = len(self.fake.requests)
@@ -139,6 +269,46 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["ha_detail"], detail)
             self.assertIn(label, result["feedback"])
+
+    async def test_named_lookup_tries_the_full_name_then_type_suffix_fallback(self):
+        await self.client.initialize()
+        for label, shortened, domain in [
+            ("Eettafel lamp", "Eettafel", "light"),
+            ("eettafellamp", "eettafel", "light"),
+            ("Avond lampgroep", "Avond", "light"),
+            ("Filmavond scène", "Filmavond", "scene"),
+        ]:
+            calls = []
+            async def rpc(method, params):
+                arguments = params["arguments"]
+                calls.append(arguments)
+                if arguments["name"] == label:
+                    return {"isError": True, "content": [{"type": "text", "text":
+                            f"No exposed entities matched name '{label}'"}]}
+                return {"isError": False, "content": []}
+            self.client._rpc = rpc
+            result = await self.client.execute("ha_GetLiveContext", {"name": label, "area": "Keuken"})
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["resolved_name"], shortened)
+            self.assertEqual(calls, [{"name": label, "area": "Keuken"},
+                                     {"name": shortened, "area": "Keuken", "domain": domain}])
+
+    async def test_suffix_fallback_preserves_exact_names_and_never_repeats_an_action(self):
+        await self.client.initialize()
+        original = {"name": "Leeslamp"}
+        calls = []
+        answer = {"isError": False, "content": []}
+        async def rpc(method, params):
+            calls.append(params["arguments"])
+            return answer
+        self.client._rpc = rpc
+        result = await self.client.execute("ha_GetLiveContext", original)
+        self.assertNotIn("resolved_name", result)
+        answer = {"isError": True, "content": [{"type": "text", "text": "MatchFailedReason.NAME"}]}
+        await self.client.execute("ha_HassTurnOn", original)
+        incompatible = {**original, "domain": "cover"}
+        await self.client.execute("ha_GetLiveContext", incompatible)
+        self.assertEqual(calls, [original, original, incompatible])
 
     async def test_auth_and_missing_integration_errors_are_sanitized(self):
         await self.client.initialize()

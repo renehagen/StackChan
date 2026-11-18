@@ -2,7 +2,7 @@
 
 Firmwareprototype voor de **officiële M5Stack StackChan met CoreS3**, met Nederlandse spraakgesprekken via **OpenAI `gpt-live-1`**. Een lokale Python-bridge op de Mac verbindt de robot met OpenAI. Die Mac moet tijdens gesprekken aanstaan en op hetzelfde bereikbare netwerk zitten. De OpenAI-sleutel blijft op de Mac.
 
-Versie 1.0.0 bevat firmwarebuild v9, getest op 17 november 2026. Tijdens een gesproken antwoord draait of knikt het hoofd af en toe. Het scherm toont een mintgroen gezicht met afgeronde lijnen. Onderin staan de microfoon, het volume en de gespreksknop.
+In stand-by staat **Gesprek gestopt** in het midden. Tijdens luisteren en spreken toont het scherm andere audiogolven. Onderin staan de microfoon, het volume en de gespreksknop. Tijdens een gesproken antwoord draait of knikt het hoofd af en toe.
 
 Zie [VALIDATION.md](VALIDATION.md) voor de regressietests, buildgegevens en de precieze grenzen van de verificatie. Maak bij een andere bridgecomputer of gewijzigde hostnaam een nieuw certificaat met `--renew`.
 
@@ -10,11 +10,12 @@ Zie [VALIDATION.md](VALIDATION.md) voor de regressietests, buildgegevens en de p
 
 Tijdens een gesprek verdwijnen de knoppen na 10 seconden zonder aanraking. Tik ergens op het scherm om ze opnieuw 10 seconden te tonen. De eerste tik toont alleen de knoppen. Na afloop blijft Start in beeld.
 
-- Tik rechtsonder op **Start**. Spreek zodra **Ik luister** verschijnt. Bij **Ik praat** hoor je het antwoord.
+- Tik rechtsonder op **Start**. Spreek zodra de microfoon rechts verschijnt.
 - **Stop** stopt de lokale audio en sluit de OpenAI-sessie af.
 - Met **Demp** linksonder zet je de microfoon stil. Tik op **Mic aan** om verder te praten.
+- Zeg **‘Stop het gesprek’**, **‘Zet je volume op 70 procent’** of **‘Demp de microfoon’** om de StackChan zelf te bedienen. Na dempen tik je op **Mic aan** om weer te kunnen praten.
 - Tik onderaan op het **volumepercentage** en gebruik **−** of **+** voor stappen van 10 procentpunt. De standaard is **90%**. Je keuze wordt na het gesprek bewaard. Het volumepaneel sluit na vijf seconden of zodra je opnieuw op het percentage tikt.
-- De mond beweegt op het niveau van de audio die aan de luidspreker wordt aangeboden.
+- Tijdens luisteren bewegen de groene balkjes vanaf de microfoon rechts naar links. Hun hoogte volgt het opnameniveau. Tijdens het antwoord slaan verticale balkjes uit op vaste posities, met dezelfde afstand als bij luisteren. Bij hardere spraak komen er paren bij, tot het patroon 1–3–1–2–1–2–1–3–1. Tijdens korte stiltes blijft de middelste lijn zichtbaar. Na circa 0,9 seconde zonder hoorbare spraak verschijnt de luistergolf weer.
 - Het hoofd beweegt vanuit de gemeten stand en keert daarna terug. Tussen gebaren zit minstens 7,8 seconden. De knop **Stop** laat de actieve servo los.
 - Tijdens een gesprek houdt de bridge de Mac wakker bij inactiviteit. Houd op batterij de klep open. Bij een verbroken verbinding geeft de StackChan na herstel aan dat je weer op Start kunt tikken. Een gesprek stopt automatisch na tien minuten.
 
@@ -39,6 +40,14 @@ Webzoeken staat standaard aan. Voorbeeld: “Zoek op wat er nieuw is in de laats
 Op 17 november 2026 bevestigde de gebruiker dat de gesproken opdrachten voor beide functies werken, inclusief Home Assistant-apparaatbediening.
 
 Home Assistant wordt apart aangemeld via `scripts/connect_home_assistant.py`. Open daarna de lokale aanmeldpagina op poort 8766; de aanmelding blijft in `.local/ha-auth.json` met rechten 0600. De bridge vernieuwt verlopen toegangstokens automatisch. Bij de lokale installatie is de native MCP-integratie met alleen **Assist** toegevoegd via de normale Home Assistant-configuratie-API, zonder YAML-wijzigingen of Home Assistant-herstart. Alleen voor Assist vrijgegeven apparaten zijn zichtbaar; deze vrijgave is niet uitgebreid.
+
+Scripts die in Home Assistant voor Assist zijn vrijgegeven verschijnen als aparte functies. Zet de gekozen objectnamen zonder `script.` als kommagescheiden lijst in `STACKCHAN_HA_SCRIPTS` in `.env.local`. Start de bridge opnieuw om zijn gereedschapslijst te laden. Gebruik een expliciete opdracht, bijvoorbeeld ‘Start het script Avondlicht’.
+
+De bridge onthoudt maximaal 32 bevestigde opdrachten voor één benoemd apparaat, één scène of een vrijgegeven script. Bij een exacte match op hetzelfde type opdracht kan StackChan de zoekstap overslaan. Home Assistant voert de opdracht opnieuw uit. De cache bewaart alleen naam, ruimte, domein, soort opdracht en vervaldatum in `.local/ha-target-cache.json`. Een doel vervalt na drie dagen of na een mislukte naam- of ruimtematch. Voor een actuele status vraagt StackChan Home Assistant.
+
+Bij een naam zoals ‘Eettafel lamp’ of ‘eettafellamp’ telt ook ‘Eettafel’ mee. Een volledige naam krijgt voorrang. Het soortwoord beheerst het domein van de verkorte zoekopdracht. ‘Woonkamer warm script’ en ‘Woonkamer warm scène’ verwijzen daardoor naar elk hun eigen type doel.
+
+Zeg bijvoorbeeld **‘Sla tv1 op als alias voor 32 inch The Frame’** en daarna **‘Zet tv1 aan’**. De bridge controleert het doel in Home Assistant en bewaart maximaal 32 uitgesproken aliassen in hetzelfde lokale cachebestand. Deze aliassen blijven bewaard na een herstart en hebben geen vervaldatum. Zeg expliciet dat je een bestaande alias wilt wijzigen om hem aan een ander doel te koppelen.
 
 De adapter gebruikt `/api/mcp/assist` en biedt bekende Assist-functies voor status, lampen, klimaat, ventilatie en media. Administratieve, alarm-, slot- en berichtfuncties worden niet toegevoegd. Zoek status bij voorkeur gericht op naam, ruimte of domein; grote overzichten krijgen een expliciete begrenzingsmelding. Voorbeelden: “Staat de eettafellamp aan?” en “Zet de eettafellamp op vijftig procent.”
 
@@ -134,7 +143,7 @@ De apparaten wisselen PCM16 mono uit. De brug en firmware v6 onderhandelen `pcm-
 De firmware buffert maximaal 4,8 seconden opname en vier seconden weergave in PSRAM. Bij de start van een gesprek kiest hij een afspeelvoorraad van 1,8 seconde of, bij een wifi-signaal van −67 dBm of zwakker, 2,1 seconden. Bij volle buffers vervalt oude audio en stijgt een teller. Een echte lees- of schrijffout van het audioapparaat kan de sessie beëindigen. De bridge buffert bij het gepaarde PCM-protocol maximaal 4,8 seconden per richting. Bij een volle TCP-zendbuffer blijft de microfoonaudio op de robot in de wachtrij terwijl de netwerktaak binnenkomende spraak blijft verwerken. Na een pauze stuurt de bridge de opgebouwde voorraad in beide richtingen tijdelijk sneller door. De audiotaken draaien op core 0 met prioriteit 5. Netwerk gebruikt core 1 met prioriteit 3. Scherm en hoofdbewegingen gebruiken core 1 met prioriteit 1.
 
 
-Live heeft geen event voor het einde van een gesproken antwoord. Daarom komt mondbeweging uit de lokale audioweergave. Bij afsluiten wacht de bridge maximaal vijf seconden op `session.closed`. Het bevestigde eindgebruik wordt onderscheiden van een verbinding die zonder die bevestiging verdwijnt. Gebruikstellerstanden zijn cumulatief en worden niet opgeteld. Gespreksaudio, transcripties en sleutels worden niet gelogd.
+De weergavestand en de hoogte van de audiogolf volgen de lokale audio. De schermtaak leest alleen niveaumetingen uit de audiotaken. Bij afsluiten wacht de bridge maximaal vijf seconden op `session.closed`. Het bevestigde eindgebruik wordt onderscheiden van een verbinding die zonder die bevestiging verdwijnt. Gebruikstellerstanden zijn cumulatief en worden niet opgeteld. Gespreksaudio, transcripties en sleutels worden niet gelogd.
 
 ## Diagnostiek
 

@@ -1,4 +1,26 @@
-# Validatie — 17 november 2026
+# Validatie
+
+## Firmware v15 en gesproken bediening — 18 november 2026
+
+De USB-upload is geverifieerd. De fysieke StackChan verwerkte de drie akoestische opdrachten. De firmware stelde 65% in, de bridge bevestigde microfoondemping en de stopopdracht beëindigde de sessie met de status **Gesprek gestopt**. Een laatste gesproken opdracht herstelde het oorspronkelijke volume van 70%. Alle 89 regressietests slaagden.
+
+## Firmware v14 en Home Assistant-scripts — 18 november 2026
+
+De USB-upload is geverifieerd. Een gesproken testopdracht op de fysieke StackChan leidde tot één geslaagde scriptoproep via de Assist-bridge. Home Assistant bevestigde via de statussen zowel het starten van het script als het activeren van de bijbehorende scène. Beide audiogolven werden tijdens de proef bijgewerkt. Alle 82 lokale regressietests slaagden.
+
+## Firmware v13 — 18 november 2026
+
+De luistergolf heeft een geleidelijkere niveauschaal. Met dezelfde akoestische testvraag was de hoogste gemeten uitslag 53 van 59 pixels vanaf de middellijn. De StackChan verwerkte de vraag en het antwoord zonder gemeten spraakgat.
+
+## Firmware v12 — 18 november 2026
+
+Tijdens de proef op de geflashte hardware bleef de spreekweergave zichtbaar in de stilte na de hoorbare spraak. Daarna verscheen de luistergolf. Een hosttest controleerde de middenlijn tijdens stilte, de afstand van 10 pixels en de maximale balkverhouding. Het gesprek duurde 28,1 seconden. Tijdens het antwoord pauzeerde de netwerkverwerking 650 ms. Er waren geen bufferoverlopen, audiohardwarefouten of gemeten gaten midden in spraak. De oorzaak van de eerder gemelde hapering bleef onbekend.
+
+## Firmware v11 — 18 november 2026
+
+De USB-upload is geverifieerd. De SHA-256 van de firmware is `55bd9164e607e8ee85addb99af21d083ca1dc5eeabcdb269268a0e712ffcc348`. In een hosttest controleerden we de luisterrichting en de negen vaste balkposities met hoogteverhouding 1–3–1–2–1–2–1–3–1. De test controleerde ook de gecentreerde tekst **Gesprek gestopt**.
+
+De fysieke StackChan voerde een gesprek van 45,3 seconden met twee akoestische testvragen en twee antwoorden. De schermtaak werkte bij beide vragen de luistergolf en bij beide antwoorden de spraakgolf bij. Tijdens het tweede antwoord duurde een gecontroleerde netwerkpauze 650 ms. De metingen registreerden nul bufferoverlopen, nul audiohardwarefouten en nul milliseconden lege afspeelbuffer midden in spraak. Na Stop rapporteerde de robot de gestopte sessie en waren de knoppen weer zichtbaar. Alle 81 regressietests slaagden.
 
 ## Firmware v9 en netwerkonderbrekingen
 

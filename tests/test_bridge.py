@@ -267,6 +267,56 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.fake.next("session.input_audio.append")
         await self.stop(socket)
 
+    async def test_voice_controls_use_device_acknowledgement_and_normal_session_close(self):
+        socket = await connect(self.url, additional_headers={
+            "Authorization": f"Bearer {TOKEN}", "X-StackChan-Controls": "voice-v1",
+        }, proxy=None)
+        await self.event(socket, "connected")
+        await self.start(socket)
+        startup = await self.fake.next("session.start")
+        self.assertIn("stackchan_control", [tool.get("name") for tool in
+                      startup["session"]["delegation"]["responses"]["tools"]])
+
+        async def call(action, **arguments):
+            await self.fake.begin_response("response_" + action, "delegation_" + action)
+            await self.fake.function_call("call_" + action, "stackchan_control",
+                                          json.dumps({"action": action, **arguments}), "delegation_" + action)
+            await self.fake.complete_response("response_" + action, "delegation_" + action)
+            return await self.event(socket, "voice_control")
+
+        volume = await call("volume", percent=70)
+        self.assertEqual(volume["percent"], 70)
+        await socket.send(json.dumps({"type": "voice_control_ack", "id": volume["id"], "ok": True}))
+        result = await self.fake.next("response.item.create")
+        self.assertEqual(json.loads(result["item"]["output"]), {"ok": True, "percent": 70})
+        await self.fake.next("response.create")
+
+        mute = await call("mute")
+        await socket.send(json.dumps({"type": "mute", "muted": True}))
+        await socket.send(json.dumps({"type": "voice_control_ack", "id": mute["id"], "ok": True}))
+        await self.fake.next("session.input_audio.mute")
+        self.assertTrue((await self.event(socket, "muted"))["muted"])
+        result = await self.fake.next("response.item.create")
+        self.assertEqual(json.loads(result["item"]["output"]), {"ok": True, "muted": True})
+        await self.fake.next("response.create")
+
+        self.fake.finalize = False
+        stop = await call("stop")
+        self.assertEqual(stop["action"], "stop")
+        await self.fake.next("session.close")
+        await socket.send(bytes(FRAME_BYTES))
+        await socket.send('{"type":"regression_barrier"}')
+        self.assertEqual(await self.event(socket), {"type": "error", "code": "invalid_command"})
+        await self.fake.send({"type": "session.closed", "usage": {"seconds": 2.5}})
+        closed = await self.event(socket)
+        self.assertEqual(closed["type"], "closed")
+        self.assertEqual(closed["reason"], "user_stop")
+        self.assertTrue(closed["usage_confirmed"])
+        await socket.send(bytes(FRAME_BYTES))
+        await socket.send('{"type":"regression_barrier"}')
+        self.assertEqual(await self.event(socket), {"type": "error", "code": "invalid_command"})
+        await socket.close()
+
     async def test_upstream_error_is_redacted_and_finalized(self):
         socket = await self.device()
         await self.start(socket)
