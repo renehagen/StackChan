@@ -1,0 +1,10 @@
+.env.local
+.env
+.venv/
+.pio/
+build/
+__pycache__/
+*.pyc
+.platformio/
+.local/
+.DS_Store

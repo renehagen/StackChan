@@ -1,0 +1,151 @@
+# StackChan met GPT Live — versie 1.0.0
+
+Firmwareprototype voor de **officiële M5Stack StackChan met CoreS3**, met Nederlandse spraakgesprekken via **OpenAI `gpt-live-1`**. Een lokale Python-bridge op de Mac verbindt de robot met OpenAI. Die Mac moet tijdens gesprekken aanstaan en op hetzelfde bereikbare netwerk zitten. De OpenAI-sleutel blijft op de Mac.
+
+Versie 1.0.0 bevat firmwarebuild v9, getest op 17 november 2026. Tijdens een gesproken antwoord draait of knikt het hoofd af en toe. Het scherm toont een mintgroen gezicht met afgeronde lijnen. Onderin staan de microfoon, het volume en de gespreksknop.
+
+Zie [VALIDATION.md](VALIDATION.md) voor de regressietests, buildgegevens en de precieze grenzen van de verificatie. Maak bij een andere bridgecomputer of gewijzigde hostnaam een nieuw certificaat met `--renew`.
+
+## Bediening
+
+Tijdens een gesprek verdwijnen de knoppen na 10 seconden zonder aanraking. Tik ergens op het scherm om ze opnieuw 10 seconden te tonen. De eerste tik toont alleen de knoppen. Na afloop blijft Start in beeld.
+
+- Tik rechtsonder op **Start**. Spreek zodra **Ik luister** verschijnt. Bij **Ik praat** hoor je het antwoord.
+- **Stop** stopt de lokale audio en sluit de OpenAI-sessie af.
+- Met **Demp** linksonder zet je de microfoon stil. Tik op **Mic aan** om verder te praten.
+- Tik onderaan op het **volumepercentage** en gebruik **−** of **+** voor stappen van 10 procentpunt. De standaard is **90%**. Je keuze wordt na het gesprek bewaard. Het volumepaneel sluit na vijf seconden of zodra je opnieuw op het percentage tikt.
+- De mond beweegt op het niveau van de audio die aan de luidspreker wordt aangeboden.
+- Het hoofd beweegt vanuit de gemeten stand en keert daarna terug. Tussen gebaren zit minstens 7,8 seconden. De knop **Stop** laat de actieve servo los.
+- Tijdens een gesprek houdt de bridge de Mac wakker bij inactiviteit. Houd op batterij de klep open. Bij een verbroken verbinding geeft de StackChan na herstel aan dat je weer op Start kunt tikken. Een gesprek stopt automatisch na tien minuten.
+
+De eerste versie ondersteunt **om de beurt praten**. Tijdens hoorbare robotspraak en een korte uitlooptijd gaat stilte naar het model om akoestische terugkoppeling te beperken. Er is geen AEC. Door de robot heen spreken om hem te onderbreken is dus nog niet ondersteund; Stop beëindigt het gesprek. De effectiviteit van deze eenvoudige echo-beveiliging moet fysiek worden beoordeeld.
+
+## Ontwerp
+
+```mermaid
+flowchart LR
+    A[CoreS3: microfoon en scherm] <-->|WSS · PCM16 mono 16 kHz| B[Lokale Python-bridge]
+    B <-->|Live WebSocket API| C[gpt-live-1]
+    C <-->|Managed Responses-delegatie| D[gpt-5.6-luna]
+    B --- E[Lokale OpenAI-sleutel]
+```
+
+`gpt-live-1` gebruikt de **Live API**, met eigen eventnamen. De bridge opent `wss://api.openai.com/v1/live/sessions`, stuurt `session.start` en wacht op `session.started`. Daarna stroomt audio continu, inclusief stilte. De standaarddelegatie naar `gpt-5.6-luna` gebruikt hosted webzoeken en lokale Home Assistant-functies. De Live-commando's `response.item.create` en `response.create` geven toolresultaten terug en hervatten de backend; er wordt geen oude Realtime-audiocyclus gebruikt.
+
+## Webzoeken en Home Assistant
+
+Webzoeken staat standaard aan. Voorbeeld: “Zoek op wat er nieuw is in de laatste versie van Home Assistant.” Zoekresultaten worden kort uitgesproken met bronvermelding.
+
+Op 17 november 2026 bevestigde de gebruiker dat de gesproken opdrachten voor beide functies werken, inclusief Home Assistant-apparaatbediening.
+
+Home Assistant wordt apart aangemeld via `scripts/connect_home_assistant.py`. Open daarna de lokale aanmeldpagina op poort 8766; de aanmelding blijft in `.local/ha-auth.json` met rechten 0600. De bridge vernieuwt verlopen toegangstokens automatisch. Bij de lokale installatie is de native MCP-integratie met alleen **Assist** toegevoegd via de normale Home Assistant-configuratie-API, zonder YAML-wijzigingen of Home Assistant-herstart. Alleen voor Assist vrijgegeven apparaten zijn zichtbaar; deze vrijgave is niet uitgebreid.
+
+De adapter gebruikt `/api/mcp/assist` en biedt bekende Assist-functies voor status, lampen, klimaat, ventilatie en media. Administratieve, alarm-, slot- en berichtfuncties worden niet toegevoegd. Zoek status bij voorkeur gericht op naam, ruimte of domein; grote overzichten krijgen een expliciete begrenzingsmelding. Voorbeelden: “Staat de eettafellamp aan?” en “Zet de eettafellamp op vijftig procent.”
+
+De toolworker werkt los van de audio. Opdrachten worden één keer uitgevoerd; Stop annuleert nog niet gestarte opdrachten. Een reeds naar Home Assistant verstuurde opdracht kan nog afronden. Fouten worden als fouten teruggegeven en beëindigen het spraakgesprek niet. Er is geen algemene REST-servicefallback.
+
+macOS moet het Python-proces van de achtergrondbridge toegang geven onder **Privacy en beveiliging → Lokaal netwerk**. Werkt een test vanuit Codex wel, maar meldt de LaunchAgent `ha_unreachable` met `network_errno: 65`, controleer dan die toestemming. Na een nieuwe aanmelding of herstelde bereikbaarheid herstart je de bridge om de toolcatalogus opnieuw te laden. Het opstartlog moet `home_assistant_ready` melden.
+
+`.venv/bin/python scripts/smoke_tools.py` controleert de echte Live-toolroute met één webzoekopdracht en alleen-lezen Home Assistant-status. Deze controle gebruikt de API maar bedient geen apparaten en bewaart geen inhoud.
+
+De CoreS3 deelt I2S-pinnen tussen de ES7210-microfooncodec en AW88298-versterker. `AudioDuplex` beheert daarom één gezamenlijke RX/TX-driver. De gewone M5Unified-microfoon- en luidsprekerdrivers blijven uitgeschakeld. Hardware-audio gebruikt 16 kHz stereo en wordt naar mono gemengd; de luidspreker krijgt beide kanalen met een bescheiden digitaal volume. Dit is gelijktijdige elektrische opname/weergave, zonder akoestische echo-onderdrukking.
+
+De hoofdservo’s hebben een eigen taak op core 1 met prioriteit 1. Opname en weergave hebben prioriteit 5 op core 0. De firmware leest de bestaande kalibratie en de servolimieten, controleert beide posities en geeft na elk gebaar het motorkoppel vrij. USB `DIAG` toont onder `head` de status, het aantal voltooide gebaren en de posities vóór, tijdens en na het laatste gebaar. USB `MOTION_TEST` voert in stand-by één gebaar uit.
+
+## Bestanden
+
+| Bestand | Doel |
+|---|---|
+| `firmware/src/main.cpp` | Bedieningsscherm, wifi/TLS, audioqueues, sessiestatus en USB-configuratie |
+| `firmware/src/AudioDuplex.cpp` | CoreS3 I2S- en codec-aansturing |
+| `firmware/platformio.ini` | Vastgepinde ESP32-S3- en bibliotheekversies |
+| `bridge/stackchan_bridge.py` | Geauthenticeerde TLS-bridge naar OpenAI Live |
+| `scripts/setup_local.py` | Lokaal certificaat en apart apparaattoken aanmaken |
+| `scripts/provision_device.py` | Wifi en bridge-instellingen via USB in het apparaat opslaan |
+| `scripts/build_firmware.sh` | Firmware compileren met PlatformIO |
+| `scripts/smoke_live.py` | Korte expliciete API-controle met 200 ms stilte |
+| `scripts/test_device_voice.py` | Herhaalbare akoestische gesprekstest op de fysieke StackChan |
+| `tests/` | Tests met lokale gesimuleerde OpenAI-server en tijdelijke configuraties |
+
+## Lokale installatie
+
+Python 3.11 of nieuwer is nodig. De ingerichte projectomgeving gebruikt Python 3.12.
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+sh scripts/build_firmware.sh
+```
+
+De firmware staat daarna in `firmware/.pio/build/stackchan/firmware.bin`. Dit is de applicatie-image. Gebruik bij een volledige installatie PlatformIO, zodat ook de juiste bootloader en partitietabel worden geschreven; schrijf deze applicatie-image niet op een gegokt flashadres.
+
+Bewaar je eigen OpenAI API-sleutel in `.env.local` als `OPENAI_API_KEY` en beperk de bestandsrechten tot `0600`. `.env.local`, `.local`, virtuele omgevingen en buildmappen zijn uitgesloten van Git. De sleutel wordt nooit in firmware opgenomen.
+
+## Bridge en apparaat instellen
+
+Kies het vaste LAN-adres of de bereikbare DNS-naam van de Mac waarop de bridge draait. Gebruik dezelfde naam bij certificaatgeneratie en apparaatconfiguratie. Vervang `BRIDGE_HOST` en `USB_POORT` hieronder door die echte waarden; wifi en wachtwoord worden lokaal gevraagd.
+
+```sh
+.venv/bin/python scripts/setup_local.py --host BRIDGE_HOST
+.venv/bin/python bridge/stackchan_bridge.py \
+  --cert .local/bridge.crt --key .local/bridge.key --host 0.0.0.0
+```
+
+De bridge kan op het lokale netwerk luisteren; zonder een afzonderlijk apparaattoken accepteert hij geen verbinding. Er is maximaal één verbonden robot. Zonder Start ontstaat geen betaalde OpenAI-sessie.
+
+Open een tweede terminal om de firmware te flashen en het apparaat te configureren. Gebruik `provision_device.py` opnieuw bij gewijzigde verbindingsinstellingen. De bridgecomputer moet aan, wakker en bereikbaar blijven.
+
+```sh
+sh scripts/build_firmware.sh --target upload --upload-port USB_POORT
+.venv/bin/python scripts/provision_device.py --port USB_POORT --host BRIDGE_HOST
+```
+
+De configuratie bevat wifi, bridge-adres, apparaattoken en het vertrouwde TLS-certificaat. Ze wordt via USB in NVS opgeslagen. NVS is in dit prototype niet versleuteld. Na opslaan herstart de robot en verbindt hij met wifi. Voor TLS moet hij via NTP de tijd kunnen synchroniseren. Certificaatcontrole wordt nooit uitgeschakeld. Een ander bridge-adres of vernieuwd certificaat vereist opnieuw provisioneren.
+
+## Controles
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+sh scripts/build_firmware.sh
+```
+
+De tests gebruiken tijdelijke bestanden en lokale mockservers, zonder OpenAI-verbruik. Voor een expliciete korte controle met de echte sleutel:
+
+```sh
+.venv/bin/python scripts/smoke_live.py
+```
+
+Dit opent een betaalde Live-sessie, stuurt alleen stilte en sluit af. Het bewijst API-toegang en sessieopbouw, geen correcte weergave/opname op de robot en geen volledig gesproken gesprek of daadwerkelijke backenddelegatie.
+
+De fysieke spraaktest gebruikt de StackChan, de lokale bridge en een echte OpenAI-sessie. De Mac maakt een korte Nederlandse testvraag en zet die via USB in het werkgeheugen van de robot. De StackChan speelt de vraag zelf af. Zijn microfoon levert de invoer. Het script meet per beurt de ontvangen antwoordframes en het microfoonsignaal bij de luidspreker. Het controleert de servofeedback, de audiobuffers en de bevestiging dat OpenAI de sessie heeft afgesloten.
+
+```sh
+.venv/bin/python scripts/test_device_voice.py --port /dev/cu.usbmodem101
+```
+
+De standaardtest duurt 110 seconden met drie vragen. Met `--stall` pauzeert de robot zijn netwerkverkeer één keer 650 ms tijdens een antwoord. Met `--stall-ms 1550` test je een langere onderbreking. Met `--tx-busy` simuleer je bovendien 3,2 seconden waarin de microfoonverbinding geen nieuwe gegevens kan aannemen. De test meet of aan beide kanten van een lege afspeelbuffer hoorbare spraak zat. Start in stand-by met het geluid aan. Er wordt alleen synthetische testspraak naar de robot gekopieerd. Net als in een gewoon gesprek verwerkt de microfoon gedurende de test ook hoorbaar omgevingsgeluid. Het rapport bevat tellers. Bij verlies van het USB-contact beëindigt de firmware een testgesprek na twaalf seconden zonder diagnostische aanvraag.
+
+## Protocol en begrenzingen
+
+De robot gebruikt WSS op `/device` met een Bearer-apparaattoken. Bij `start` wacht hij op `ready` met 16 kHz. De bridge bevestigt `mute` zodra OpenAI de wijziging bevestigt. `stop` sluit de sessie af.
+
+De apparaten wisselen PCM16 mono uit. De brug en firmware v6 onderhandelen `pcm-pair-v1` via de HTTP-header `X-StackChan-Audio` en het antwoord `connected`. Een bericht bevat maximaal twee blokken van 20 ms. Een volledig stil bericht in beide richtingen gebruikt één byte voor het aantal blokken. De bridge herstelt die samples en klokt de oorspronkelijke 20 ms-blokken naar OpenAI. Oudere apparaten sturen en ontvangen één blok per bericht.
+
+De firmware buffert maximaal 4,8 seconden opname en vier seconden weergave in PSRAM. Bij de start van een gesprek kiest hij een afspeelvoorraad van 1,8 seconde of, bij een wifi-signaal van −67 dBm of zwakker, 2,1 seconden. Bij volle buffers vervalt oude audio en stijgt een teller. Een echte lees- of schrijffout van het audioapparaat kan de sessie beëindigen. De bridge buffert bij het gepaarde PCM-protocol maximaal 4,8 seconden per richting. Bij een volle TCP-zendbuffer blijft de microfoonaudio op de robot in de wachtrij terwijl de netwerktaak binnenkomende spraak blijft verwerken. Na een pauze stuurt de bridge de opgebouwde voorraad in beide richtingen tijdelijk sneller door. De audiotaken draaien op core 0 met prioriteit 5. Netwerk gebruikt core 1 met prioriteit 3. Scherm en hoofdbewegingen gebruiken core 1 met prioriteit 1.
+
+
+Live heeft geen event voor het einde van een gesproken antwoord. Daarom komt mondbeweging uit de lokale audioweergave. Bij afsluiten wacht de bridge maximaal vijf seconden op `session.closed`. Het bevestigde eindgebruik wordt onderscheiden van een verbinding die zonder die bevestiging verdwijnt. Gebruikstellerstanden zijn cumulatief en worden niet opgeteld. Gespreksaudio, transcripties en sleutels worden niet gelogd.
+
+## Diagnostiek
+
+`.local/logs/bridge-error.log` bevat JSON-metingen: apparaatstatistieken elke vijf seconden, sessiestatistieken elke vijftien seconden en de eerste stopreden. Onder andere wifi-signaal, blokkerende netwerkduur, audiobufferverlies, I2S-fouten, volume en geheugengebruik worden bijgehouden. `playback_underruns` telt ook normale stiltes na antwoorden; die teller alleen bewijst geen hoorbare hapering. Voor HA-aanroepen vermeldt `tool_status` de doorgegeven `name` en `area`. Een ontbrekende waarde verschijnt als `null`. Bij een gerapporteerde HA-fout bevatten `error_code` en, indien beschikbaar, `ha_detail` de reden. `tx_wait_max_ms` geeft de langste wachttijd vóór verzending en `failed_send_ms` de duur van een mislukte schrijfoperatie. `voiced_gap_ms` meet de duur van lege afspeelbuffers midden in herkende spraak. USB-opdracht `DIAG` geeft aanvullende hardwarestatus. Audio, transcripties en credentials worden niet gelogd. Open USB tijdens gesprekken liever niet: dat kan het apparaat resetten.
+
+## Bronnen
+
+- [OpenAI GPT Live-model](https://developers.openai.com/api/docs/models/gpt-live-1)
+- [Live WebSocket-protocol en events](https://developers.openai.com/api/reference/resources/live/primary-websocket)
+- [OpenAI WebSocket-audiogids](https://developers.openai.com/api/docs/guides/voice-websockets?api=live)
+- [Officiële M5Stack StackChan-hardware](https://docs.m5stack.com/en/StackChan/)
+- [M5Unified 0.2.12 codec-initialisatie](https://github.com/m5stack/M5Unified/blob/0.2.12/src/M5Unified.cpp)
+
+MIT-attributie voor overgenomen codec-initialisatie staat in `AudioDuplex.cpp`.

@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE svg
+  PUBLIC '-//W3C//DTD SVG 1.0//EN'
+  'http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd'>
+<svg width="1510" height="942" preserveAspectRatio="xMinYMin meet" viewBox="0 0 1510 942" xmlns="http://www.w3.org/2000/svg" version="1.0" fill-rule="evenodd" xmlns:xlink="http://www.w3.org/1999/xlink">
+	<title>...</title>
+	<desc>...</desc>
+	<clipPath id="clip">
+		<rect x="0" y="0" width="1510" height="942"/>
+	</clipPath>
+	<g id="group" transform="scale(1,-1) translate(0,-942)" style="clip-path: url(#clip)">
+		<g transform="">
+			<rect x="0" y="0" width="1510" height="942" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(95%,95%,93%); fill-rule: evenodd;"/>
+			<text x="51" y="883" style="font-family: Arial-Bold; font-size: 17px;fill: rgb(6%,41%,33%); stroke:none;" transform="translate(0,1766) scale(1,-1)">STACKCHAN   /   FIRMWARE V6</text>
+			<text x="51" y="819" style="font-family: Arial-Bold; font-size: 56px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,1638) scale(1,-1)">Van stem naar antwoord</text>
+			<text x="52" y="778" style="font-family: Arial; font-size: 23px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,1556) scale(1,-1)">De robot verzorgt de audio en beweging. De MacBook Air verbindt hem met OpenAI en Home Assistant.</text>
+			<path d="M 244,713 L 734,713 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 734,713 L 725,708.5 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 734,713 L 725,717.5 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 244,713 L 253,717.5 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 244,713 L 253,708.5 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 777,713 L 1266,713 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 1266,713 L 1257,708.5 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 1266,713 L 1257,717.5 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 777,713 L 786,717.5 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 777,713 L 786,708.5 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<rect x="336.0" y="696" width="306.0" height="37" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(95%,95%,93%); fill-rule: evenodd;"/>
+			<text x="359.1259765625" y="707" style="font-family: Arial-Bold; font-size: 17px;fill: rgb(6%,41%,33%); stroke:none;" transform="translate(0,1414) scale(1,-1)">Wifi  ·  WSS  ·  PCM16 op 16 kHz</text>
+			<rect x="852.0" y="696" width="340.0" height="37" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(95%,95%,93%); fill-rule: evenodd;"/>
+			<text x="869.435791015625" y="707" style="font-family: Arial-Bold; font-size: 17px;fill: rgb(9%,37%,63%); stroke:none;" transform="translate(0,1414) scale(1,-1)">Internet  ·  beveiligde Live WebSocket</text>
+			<rect x="50" y="307" width="414" height="376" rx="18" ry="18" style="stroke: rgb(79%,83%,81%); stroke-linecap: butt; stroke-width: 1.4; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<rect x="51" y="583" width="412" height="99" rx="17" ry="17" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(89%,94%,92%); fill-rule: evenodd;"/>
+			<rect x="51" y="582" width="412" height="20" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(89%,94%,92%); fill-rule: evenodd;"/>
+			<text x="145" y="635" style="font-family: Arial-Bold; font-size: 34px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,1270) scale(1,-1)">StackChan</text>
+			<text x="146" y="606" style="font-family: Arial-Bold; font-size: 17px;fill: rgb(6%,41%,33%); stroke:none;" transform="translate(0,1212) scale(1,-1)">M5Stack CoreS3  ·  ESP32-S3</text>
+			<rect x="74" y="615" width="52" height="44" rx="11" ry="11" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(6%,14%,19%); fill-rule: evenodd;"/>
+			<circle cx="89" cy="641" r="4" style="stroke: none; stroke-linecap: butt; stroke-width: 2; fill: rgb(52%,96%,72%); fill-rule: evenodd;"/>
+			<circle cx="110" cy="641" r="4" style="stroke: none; stroke-linecap: butt; stroke-width: 2; fill: rgb(52%,96%,72%); fill-rule: evenodd;"/>
+			<path d="M 90 630 C 95 623 105 623 110 630 " style="stroke: rgb(52%,96%,72%); stroke-linecap: round; stroke-width: 2.6; fill: none; fill-rule: evenodd;"/>
+			<path d="M 83,609 L 118,609 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 3;"/>
+			<rect x="548" y="307" width="414" height="376" rx="18" ry="18" style="stroke: rgb(79%,83%,81%); stroke-linecap: butt; stroke-width: 1.4; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<rect x="549" y="583" width="412" height="99" rx="17" ry="17" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(89%,93%,97%); fill-rule: evenodd;"/>
+			<rect x="549" y="582" width="412" height="20" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(89%,93%,97%); fill-rule: evenodd;"/>
+			<text x="643" y="635" style="font-family: Arial-Bold; font-size: 34px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,1270) scale(1,-1)">MacBook Air</text>
+			<text x="644" y="606" style="font-family: Arial-Bold; font-size: 17px;fill: rgb(9%,37%,63%); stroke:none;" transform="translate(0,1212) scale(1,-1)">Python-bridge  ·  op je Mac</text>
+			<rect x="572" y="622" width="52" height="35" rx="4" ry="4" style="stroke: rgb(9%,37%,63%); stroke-linecap: butt; stroke-width: 1.4; fill: none; fill-rule: evenodd;"/>
+			<path d="M 567,616 L 629,616 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 3;"/>
+			<path d="M 574,621 L 568,616 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2;"/>
+			<path d="M 622,621 L 628,616 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2;"/>
+			<rect x="1046" y="307" width="414" height="376" rx="18" ry="18" style="stroke: rgb(79%,83%,81%); stroke-linecap: butt; stroke-width: 1.4; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<rect x="1047" y="583" width="412" height="99" rx="17" ry="17" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(93%,91%,96%); fill-rule: evenodd;"/>
+			<rect x="1047" y="582" width="412" height="20" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(93%,91%,96%); fill-rule: evenodd;"/>
+			<text x="1141" y="635" style="font-family: Arial-Bold; font-size: 34px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,1270) scale(1,-1)">OpenAI</text>
+			<text x="1142" y="606" style="font-family: Arial-Bold; font-size: 17px;fill: rgb(41%,27%,60%); stroke:none;" transform="translate(0,1212) scale(1,-1)">Live API  ·  in de cloud</text>
+			<path d="M 1068,642.5 L 1068,633.5 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 3.3;"/>
+			<path d="M 1076,648 L 1076,628 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 3.3;"/>
+			<path d="M 1084,654 L 1084,622 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 3.3;"/>
+			<path d="M 1092,660 L 1092,616 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 3.3;"/>
+			<path d="M 1100,652 L 1100,624 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 3.3;"/>
+			<path d="M 1108,647 L 1108,629 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 3.3;"/>
+			<path d="M 1116,642 L 1116,634 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 3.3;"/>
+			<text x="73" y="548" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,1096) scale(1,-1)">Microfoon en luidspreker</text>
+			<text x="73" y="520" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,1040) scale(1,-1)">ES7210 neemt op. De AW88298 versterkt</text>
+			<text x="73" y="496" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,992) scale(1,-1)">het gesproken antwoord voor de luidspreker.</text>
+			<text x="73" y="457" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,914) scale(1,-1)">Audio heeft voorrang</text>
+			<text x="73" y="429" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,858) scale(1,-1)">Core 0 verzorgt opname en weergave.</text>
+			<text x="73" y="405" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,810) scale(1,-1)">PSRAM vangt tijdelijke wifi-vertraging op.</text>
+			<text x="73" y="376" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,752) scale(1,-1)">Scherm en hoofd</text>
+			<text x="73" y="348" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,696) scale(1,-1)">Core 1 regelt netwerk, touch en gezicht.</text>
+			<text x="73" y="324" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,648) scale(1,-1)">Twee servo’s draaien en knikken subtiel.</text>
+			<text x="571" y="548" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,1096) scale(1,-1)">Gespreksverbinding</text>
+			<text x="571" y="520" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,1040) scale(1,-1)">Opent na Start een Live-sessie en stuurt</text>
+			<text x="571" y="496" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,992) scale(1,-1)">spraak in beide richtingen door.</text>
+			<text x="571" y="457" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,914) scale(1,-1)">Audiobuffers</text>
+			<text x="571" y="429" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,858) scale(1,-1)">Bundelt en doseert de audioblokken.</text>
+			<text x="571" y="405" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,810) scale(1,-1)">Volledige stilte reist als één byte.</text>
+			<text x="571" y="376" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,752) scale(1,-1)">Lokale toegang</text>
+			<text x="571" y="348" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,696) scale(1,-1)">Bewaart de API-sleutel. Een aparte taak</text>
+			<text x="571" y="324" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,648) scale(1,-1)">voert Home Assistant-opdrachten uit.</text>
+			<text x="1069" y="548" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,1096) scale(1,-1)">gpt-live-1</text>
+			<text x="1069" y="520" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,1040) scale(1,-1)">Verwerkt de live spraakstroom en spreekt</text>
+			<text x="1069" y="496" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,992) scale(1,-1)">het antwoord uit met de stem marin.</text>
+			<text x="1069" y="457" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,914) scale(1,-1)">gpt-5.6-luna</text>
+			<text x="1069" y="429" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,858) scale(1,-1)">Het Live-model delegeert via de Responses</text>
+			<text x="1069" y="405" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,810) scale(1,-1)">API en kan daarbij tools inschakelen.</text>
+			<text x="1069" y="376" style="font-family: Arial-Bold; font-size: 21px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,752) scale(1,-1)">Twee routes voor tools</text>
+			<text x="1069" y="348" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,696) scale(1,-1)">Webzoeken draait bij OpenAI. Huisopdrachten</text>
+			<text x="1069" y="324" style="font-family: Arial; font-size: 18px;fill: rgb(24%,35%,35%); stroke:none;" transform="translate(0,648) scale(1,-1)">gaan via de bridge terug naar je netwerk.</text>
+			<path d="M 257,302 L 257,265 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 257,265 L 252.5,274 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 257,265 L 261.5,274 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 257,302 L 261.5,293 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 257,302 L 252.5,293 Z" style="stroke: rgb(6%,41%,33%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 755,302 L 755,265 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 755,265 L 750.5,274 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 755,265 L 759.5,274 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 755,302 L 759.5,293 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 755,302 L 750.5,293 Z" style="stroke: rgb(9%,37%,63%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 1253,302 L 1253,265 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 1253,265 L 1248.5,274 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 1253,265 L 1257.5,274 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 1253,302 L 1257.5,293 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 1253,302 L 1248.5,293 Z" style="stroke: rgb(41%,27%,60%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<rect x="50" y="128" width="414" height="129" rx="14" ry="14" style="stroke: rgb(79%,83%,81%); stroke-linecap: butt; stroke-width: 1.4; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="71" y="218" style="font-family: Arial-Bold; font-size: 25px;fill: rgb(6%,41%,33%); stroke:none;" transform="translate(0,436) scale(1,-1)">USB-test vanaf de Mac</text>
+			<text x="71" y="183" style="font-family: Arial; font-size: 17px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,366) scale(1,-1)">De robot speelt een vraag af en hoort</text>
+			<text x="71" y="157" style="font-family: Arial; font-size: 16px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,314) scale(1,-1)">met zijn microfoon de vraag én het antwoord.</text>
+			<rect x="548" y="128" width="414" height="129" rx="14" ry="14" style="stroke: rgb(79%,83%,81%); stroke-linecap: butt; stroke-width: 1.4; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="569" y="218" style="font-family: Arial-Bold; font-size: 25px;fill: rgb(9%,37%,63%); stroke:none;" transform="translate(0,436) scale(1,-1)">Home Assistant</text>
+			<text x="569" y="183" style="font-family: Arial; font-size: 17px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,366) scale(1,-1)">De bridge gebruikt MCP Assist met OAuth</text>
+			<text x="569" y="157" style="font-family: Arial; font-size: 16px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,314) scale(1,-1)">voor status en bediening van vrijgegeven apparaten.</text>
+			<rect x="1046" y="128" width="414" height="129" rx="14" ry="14" style="stroke: rgb(79%,83%,81%); stroke-linecap: butt; stroke-width: 1.4; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="1067" y="218" style="font-family: Arial-Bold; font-size: 25px;fill: rgb(41%,27%,60%); stroke:none;" transform="translate(0,436) scale(1,-1)">Webzoeken</text>
+			<text x="1067" y="183" style="font-family: Arial; font-size: 17px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,366) scale(1,-1)">De webzoektool haalt actuele bronnen op.</text>
+			<text x="1067" y="157" style="font-family: Arial; font-size: 16px;fill: rgb(7%,18%,19%); stroke:none;" transform="translate(0,314) scale(1,-1)">Het resultaat komt terug in het gesprek.</text>
+			<rect x="50" y="34" width="1410" height="58" rx="12" ry="12" style="stroke: none; stroke-linecap: butt; stroke-width: 1.4; fill: rgb(9%,22%,22%); fill-rule: evenodd;"/>
+			<text x="74" y="56" style="font-family: Arial-Bold; font-size: 19px;fill: rgb(59%,95%,75%); stroke:none;" transform="translate(0,112) scale(1,-1)">Op de StackChan</text>
+			<text x="254" y="56" style="font-family: Arial; font-size: 20px;fill: rgb(100%,100%,100%); stroke:none;" transform="translate(0,112) scale(1,-1)">Tik op Start</text>
+			<path d="M 376,62 L 409,62 Z" style="stroke: rgb(59%,95%,75%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 409,62 L 400,57.5 Z" style="stroke: rgb(59%,95%,75%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 409,62 L 400,66.5 Z" style="stroke: rgb(59%,95%,75%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<text x="429" y="56" style="font-family: Arial; font-size: 20px;fill: rgb(100%,100%,100%); stroke:none;" transform="translate(0,112) scale(1,-1)">Praat bij ‘Ik luister’</text>
+			<path d="M 624,62 L 660,62 Z" style="stroke: rgb(59%,95%,75%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 660,62 L 651,57.5 Z" style="stroke: rgb(59%,95%,75%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<path d="M 660,62 L 651,66.5 Z" style="stroke: rgb(59%,95%,75%); stroke-linecap: round; stroke-width: 2.5;"/>
+			<text x="681" y="56" style="font-family: Arial; font-size: 20px;fill: rgb(100%,100%,100%); stroke:none;" transform="translate(0,112) scale(1,-1)">Bij ‘Ik praat’ hoor je het antwoord en beweegt het gezicht mee.</text>
+		</g>
+	</g>
+</svg>
