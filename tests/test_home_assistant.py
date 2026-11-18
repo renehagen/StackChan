@@ -98,6 +98,61 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"ok": True, "text": "Lamp is on"})
         self.assertEqual(self.fake.calls, [{"name": "HassTurnOn", "arguments": {"name": "living room"}}])
 
+    async def test_timed_out_status_retries_once_and_action_does_not_retry(self):
+        await self.client.initialize()
+        attempts = []
+        real_open = self.fake.open
+        offline = False
+
+        def intermittently_unavailable(request, *, timeout):
+            event = json.loads(request.data)
+            name = event["params"]["name"]
+            attempts.append((name, event["id"], timeout))
+            if offline or len(attempts) == 1 or name == "HassTurnOn":
+                raise TimeoutError("private endpoint")
+            return real_open(request, timeout=timeout)
+
+        self.fake.open = intermittently_unavailable
+        self.assertTrue((await self.client.execute("ha_GetLiveContext", {"name": "lamp"}))["ok"])
+        self.assertEqual([name for name, _, _ in attempts], ["GetLiveContext", "GetLiveContext"])
+        self.assertNotEqual(attempts[0][1], attempts[1][1])
+        self.assertEqual([timeout for _, _, timeout in attempts], [3, 3])
+        result = await self.client.execute("ha_HassTurnOn", {"name": "lamp"})
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual((result["error"], result["ha_operation"], result["attempts"], result["network_kind"]),
+                         ("ha_unreachable", "action", 1, "TimeoutError"))
+        self.assertNotIn("private endpoint", json.dumps(result))
+        offline = True
+        result = await self.client.execute("ha_GetLiveContext", {"name": "lamp"})
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual((result["error"], result["ha_operation"], result["attempts"]), ("ha_unreachable", "read", 2))
+
+    async def test_status_resolves_spoken_lightstrip_name_and_reports_offline_device(self):
+        self.fake.catalog[0]["inputSchema"]["properties"].update(
+            name={"type": "string"}, area={"type": "string"}, domain={"type": "string"})
+        await self.client.initialize()
+        calls = []
+        row = "- names: Lightstrip Elize\n  domain: light\n  state: unavailable\n  areas: Elize\n"
+
+        async def rpc(method, params):
+            arguments = params["arguments"]
+            calls.append(arguments)
+            if arguments.get("name") == "ledstrip Elise":
+                return {"isError": True, "content": [{"type": "text",
+                        "text": "No exposed entities matched name 'ledstrip Elise'"}]}
+            text = row if arguments else (row + "- names: Elize slaapkamer\n  domain: light\n"
+                                          "- names: Lightstrip Feline\n  domain: light\n  areas: Feline\n")
+            return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": text})}]}
+
+        self.client._rpc = rpc
+        result = await self.client.execute("ha_GetLiveContext", {"name": "ledstrip Elise", "domain": "light"})
+        self.assertEqual((result["ok"], result["error"], result["resolved_name"]),
+                         (False, "device_unavailable", "Lightstrip Elize"))
+        self.assertEqual([item.get("name") for item in calls], ["ledstrip Elise", None, "Lightstrip Elize"])
+        lookup = await self.client.execute("ha_FindTarget", {"name": "ledstrip van Elise", "domain": "light"})
+        self.assertEqual(lookup["name"], "Lightstrip Elize")
+        self.assertTrue((await self.client.execute("ha_GetLiveContext", {}))["ok"])
+
     async def test_only_selected_available_scripts_are_routed(self):
         self.client = HomeAssistantTools(self.path, scripts=("woonkamer_warm", "missing_script"))
         self.client._opener = self.fake

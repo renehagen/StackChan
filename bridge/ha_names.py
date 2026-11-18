@@ -28,6 +28,7 @@ class Target:
     domain: str
     areas: tuple[str, ...] = ()
     tool: str | None = None
+    state: str | None = None
 
     def reference(self) -> dict:
         item = {"name": self.names[0], "domain": self.domain, "area": self.areas[0] if self.areas else None}
@@ -53,7 +54,8 @@ def context_targets(text: str) -> list[Target]:
         names = _items(row.get("names"))
         domain = row.get("domain")
         if names and isinstance(domain, str) and re.fullmatch(r"[a-z_]+", domain):
-            targets.append(Target(names, domain, _items(row.get("areas"))))
+            state = row.get("state")
+            targets.append(Target(names, domain, _items(row.get("areas")), state=state if isinstance(state, str) else None))
     return targets
 
 
@@ -68,7 +70,19 @@ def _name_variants(query: str) -> list[tuple[str, str | None]]:
     return variants
 
 
-def _score(query: str, name: str, *, stripped: bool) -> float:
+def _lightstrip_name(label: str) -> str | None:
+    # Only strip the separate Dutch preposition, preserving names such as Vanessa.
+    label = re.sub(r"^((?:led|light|licht)[ _-]*strip)[ _-]+van[ _-]+", r"\1 ", label, flags=re.I)
+    key = name_key(label)
+    for noun in ("ledstrip", "lightstrip", "lichtstrip"):
+        if key.startswith(noun) and len(key) - len(noun) >= 3:
+            return key[len(noun):]
+        if key.endswith(noun) and len(key) - len(noun) >= 3:
+            return key[:-len(noun)]
+    return None
+
+
+def _score(query: str, name: str, *, stripped: bool, domain: str) -> float:
     if query.casefold() == name.casefold():
         return 1.0 if stripped else 1.2
     left, right = name_key(query), name_key(name)
@@ -77,15 +91,24 @@ def _score(query: str, name: str, *, stripped: bool) -> float:
         return 0.0
     if left == right:
         return 1.0 if stripped else 1.1
+    strip_names = False
+    if domain == "light":
+        query_strip, target_strip = _lightstrip_name(query), _lightstrip_name(name)
+        if query_strip and target_strip:
+            left, right = query_strip, target_strip
+            if left == right:
+                return 1.0
+            strip_names = True
     # Keep model numbers and explicit locations/directions distinct.
-    if (min(len(left), len(right)) < 6
+    if (min(len(left), len(right)) < (5 if strip_names else 6)
             or _DIRECTIONS.intersection(re.findall(r"\w+", query.casefold()))
             != _DIRECTIONS.intersection(re.findall(r"\w+", name.casefold()))):
         return 0.0
     matcher = SequenceMatcher(None, left, right, autojunk=False)
     edits = sum(max(b - a, d - c) for op, a, b, c, d in matcher.get_opcodes() if op != "equal")
     score = matcher.ratio()
-    return score if edits <= (2 if max(len(left), len(right)) >= 10 else 1) and score >= .84 else 0.0
+    minimum = .80 if strip_names and min(len(left), len(right)) == 5 else .84
+    return score if edits <= (2 if max(len(left), len(right)) >= 10 else 1) and score >= minimum else 0.0
 
 
 def find_targets(query: str, targets: list[Target], *, domains: tuple[str, ...] = (),
@@ -98,7 +121,7 @@ def find_targets(query: str, targets: list[Target], *, domains: tuple[str, ...] 
             continue
         if area_key and area_key not in {name_key(value) for value in target.areas}:
             continue
-        score = max((_score(value, name, stripped=bool(inferred))
+        score = max((_score(value, name, stripped=bool(inferred), domain=target.domain)
                      for value, inferred in variants if inferred in (None, target.domain)
                      for name in target.names), default=0.0)
         if score:

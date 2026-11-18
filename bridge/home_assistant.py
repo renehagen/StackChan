@@ -43,6 +43,8 @@ FIND_TARGET_TOOL = "ha_FindTarget"
 ATOMS3_TOOL = "ha_script_stackchan_atoms3_ledstrip"
 ATOMS3_NAME = "AtomS3 LED Strip"
 CATALOG_TTL = 45
+READ_ATTEMPT_TIMEOUT = 3.0
+READ_ONLY_TOOLS = frozenset({"GetLiveContext", "HassGetState"})
 TOOL_DOMAINS = {"ha_HassLightSet": "light", "ha_HassClimateSetTemperature": "climate",
                 "ha_HassFanSetSpeed": "fan", "ha_HassSetVolume": "media_player"}
 # These are device/read intents. Administrative, messaging and security tools
@@ -215,7 +217,7 @@ def _decode_response(response: Any, request_id: int | None, *, deadline: float |
         parts: list[bytes] = []
         while True:
             if deadline is not None and time.monotonic() > deadline:
-                raise HomeAssistantError("ha_unreachable")
+                raise TimeoutError("Home Assistant response deadline")
             line = response.readline(min(65537, MAX_BODY - total + 1))
             total += len(line)
             if total > MAX_BODY or len(line) > 65536:
@@ -239,7 +241,7 @@ def _decode_response(response: Any, request_id: int | None, *, deadline: float |
     total = 0
     while True:
         if deadline is not None and time.monotonic() > deadline:
-            raise HomeAssistantError("ha_unreachable")
+            raise TimeoutError("Home Assistant response deadline")
         chunk = response.read1(min(65536, MAX_BODY - total + 1))
         if not chunk:
             break
@@ -328,8 +330,8 @@ class HomeAssistantTools:
         self._catalog_rows: list[Target] = []
         self._catalog_until = 0.0
 
-    def _http(self, path: str, body: bytes, *, form: bool = False,
-              request_id: int | None = None) -> tuple[Any, str | None]:
+    def _http(self, path: str, body: bytes, *, form: bool = False, request_id: int | None = None,
+              timeout: float | None = None) -> tuple[Any, str | None]:
         headers = {"Content-Type": "application/x-www-form-urlencoded" if form else "application/json",
                    "Accept": "application/json, text/event-stream"}
         if not form:
@@ -338,12 +340,14 @@ class HomeAssistantTools:
             if self._session_id:
                 headers["Mcp-Session-Id"] = self._session_id
         request = Request(self._auth["base_url"] + path, data=body, headers=headers, method="POST")
+        timeout = self._timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         try:
-            with self._opener.open(request, timeout=self._timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 session_id = response.headers.get("Mcp-Session-Id")
                 if session_id and (len(session_id) > 256 or any(ord(c) < 33 or ord(c) > 126 for c in session_id)):
                     raise HomeAssistantError("invalid_mcp_response")
-                return _decode_response(response, request_id, deadline=time.monotonic() + self._timeout), session_id
+                return _decode_response(response, request_id, deadline=deadline), session_id
         except HTTPError as error:
             code = {401: "authentication_required", 403: "permission_denied",
                     404: "assist_mcp_not_configured", 429: "rate_limited"}.get(error.code, "ha_http_error")
@@ -378,17 +382,35 @@ class HomeAssistantTools:
     async def _rpc(self, method: str, params: dict[str, Any] | None = None,
                    *, notification: bool = False) -> Any:
         async with self._transport_lock:
-            await self._ensure_auth()
-            payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-            request_id = None
-            if not notification:
-                self._request_id += 1
-                request_id = self._request_id
-                payload["id"] = request_id
-            if params is not None:
-                payload["params"] = params
-            result, session_id = await _finish_thread(
-                self._http, "/api/mcp/assist", json.dumps(payload, allow_nan=False).encode(), request_id=request_id)
+            try:
+                await self._ensure_auth()
+            except HomeAssistantError as error:
+                error.operation = "auth"
+                raise
+            tool = params.get("name") if method == "tools/call" and params else None
+            read_only = tool in READ_ONLY_TOOLS
+            timeout = min(self._timeout, READ_ATTEMPT_TIMEOUT) if read_only else self._timeout
+            # Retry only a status read, with a fresh request ID. A write may
+            # already have been applied by Home Assistant even if its reply is lost.
+            for attempt in range(2 if read_only else 1):
+                payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+                request_id = None
+                if not notification:
+                    self._request_id += 1
+                    request_id = payload["id"] = self._request_id
+                if params is not None:
+                    payload["params"] = params
+                try:
+                    result, session_id = await _finish_thread(
+                        self._http, "/api/mcp/assist", json.dumps(payload, allow_nan=False).encode(),
+                        request_id=request_id, timeout=timeout)
+                    break
+                except HomeAssistantError as error:
+                    if read_only and attempt == 0 and str(error) == "ha_unreachable":
+                        continue
+                    error.operation = "read" if read_only else "action" if tool else method
+                    error.attempts = attempt + 1
+                    raise
             if session_id:
                 self._session_id = session_id
             if notification:
@@ -837,7 +859,7 @@ class HomeAssistantTools:
                             if shortened:
                                 retry = await self.execute(name, shortened, _suffix_fallback=False,
                                                            _resolve_alias=_resolve_alias, _resolve_name=False)
-                                if retry.get("ok"):
+                                if retry.get("ok") or retry.get("error") == "device_unavailable":
                                     return {**retry, "resolved_name": shortened["name"],
                                             "resolved_domain": shortened["domain"]}
                     if (match or detail == "no_valid_targets") and (target := _target_label(arguments.get("name"))):
@@ -856,6 +878,14 @@ class HomeAssistantTools:
                         return {**output, **target}
                 return output
             text = "\n".join(rendered)
+            if name == "ha_GetLiveContext" and label:
+                rows = context_targets(text)
+                if len(rows) == 1 and rows[0].state == "unavailable":
+                    target = rows[0]
+                    device_name = diagnostic_text(target.names[0], 80)
+                    return {"ok": False, "error": "device_unavailable", "resolved_name": device_name,
+                            "resolved_domain": target.domain,
+                            "feedback": f"Home Assistant is bereikbaar. {device_name} zelf is onbereikbaar."}
             output: dict[str, Any] = {"ok": True, "text": text[:MAX_OUTPUT]}
             if len(text) > MAX_OUTPUT or omitted_json:
                 output["truncated"] = True
@@ -870,6 +900,19 @@ class HomeAssistantTools:
                 output.update(resolved_name=resolved["name"], resolved_domain=resolved["domain"])
             return output
         except HomeAssistantError as error:
-            return {"ok": False, "error": str(error), **({"ha_detail": error.detail} if error.detail else {})}
+            output = {"ok": False, "error": str(error)}
+            if error.detail:
+                output["ha_detail"] = error.detail
+            if str(error) == "ha_unreachable":
+                operation = getattr(error, "operation", None)
+                output.update(ha_operation=operation, attempts=getattr(error, "attempts", None),
+                              network_errno=getattr(error, "network_errno", None),
+                              network_kind=getattr(error, "network_kind", None))
+                output["feedback"] = {
+                    "read": "Home Assistant gaf tijdelijk geen antwoord op deze opvraag.",
+                    "action": "Home Assistant gaf geen bevestiging. Het is onzeker of de opdracht is uitgevoerd.",
+                    "auth": "Home Assistant reageerde niet bij het vernieuwen van de aanmelding.",
+                }.get(operation, "Home Assistant gaf tijdelijk geen antwoord.")
+            return output
         except (TypeError, ValueError, OverflowError):
             return {"ok": False, "error": "invalid_tool_arguments"}

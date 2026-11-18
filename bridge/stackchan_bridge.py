@@ -297,7 +297,9 @@ class Config:
                             "toolresultaat. Gebruik bij fouten de feedback of vertaal ha_detail naar gewoon Nederlands. "
                             "Noem naam en opgegeven ruimte. Als de zoekactie geen eenduidige match oplevert, vraag om verduidelijking. "
                             "Meld bij gedeeltelijke uitvoering of time-out wat onzeker is en herhaal de bediening niet. "
-                            "Onderscheid een verlopen aanmelding van een netwerkprobleem."
+                            "Onderscheid een verlopen aanmelding, een tijdelijke time-out, een onbereikbaar apparaat "
+                            "en een doelnaam die niet is gevonden. Meld bij device_unavailable dat het specifieke apparaat "
+                            "onbereikbaar is. Meld een mislukte opvraag als tijdelijk als andere Home Assistant-opvragen werken."
                             + target_context + alias_context
                         ),
                         "tools": tools,
@@ -619,7 +621,7 @@ class LiveSession:
             if isinstance(domain, list):
                 domain = ", ".join(item for item in domain if isinstance(item, str))
             fields["domain"] = diagnostic_text(domain, 128)
-            if outcome == "ok" and isinstance(result, dict) and result.get("ok"):
+            if outcome == "ok" and isinstance(result, dict):
                 resolved_name = result.get("resolved_name") or (result.get("name") if name == "ha_FindTarget" else None)
                 if resolved_name:
                     fields["resolved_name"] = diagnostic_text(resolved_name, 128)
@@ -634,6 +636,12 @@ class LiveSession:
             if reported_failure:
                 fields["error_code"] = diagnostic_text(result.get("error"))
                 fields["ha_detail"] = diagnostic_text(result.get("ha_detail"))
+                if result.get("error") == "ha_unreachable":
+                    for key in ("attempts", "network_errno"):
+                        if type(result.get(key)) is int:
+                            fields[key] = result[key]
+                    for key in ("ha_operation", "network_kind"):
+                        fields[key] = diagnostic_text(result.get(key), 40)
         self._tool_log("tool_reported_failure" if reported_failure else outcome, name, **fields)
         item = {"type": "function_call_output", "call_id": call["call_id"], "output": encoded}
         if valid_caller and caller is not None:
