@@ -8,6 +8,7 @@ using StateReader = State (*)();
 
 // The motion task owns UART1. The callback reads only session/audio atomics.
 void begin(StateReader state);
+void requestConversationPose();
 bool requestTest();  // One short gesture while idle, using the live motion path.
 bool standbySettled();
 void standbyStats(JsonObject out);

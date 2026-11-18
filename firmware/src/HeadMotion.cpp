@@ -17,6 +17,7 @@ constexpr uart_port_t kPort = UART_NUM_1;
 constexpr int kLegMs = 470;
 constexpr uint32_t kBetweenGesturesMs = 7800;
 constexpr uint8_t kTorque = 40, kGoal = 42, kFeedback = 56;
+constexpr int kMinimumUprightOffset = 16, kDefaultUprightOffset = 48;
 struct Axis {
   uint8_t id;
   int low, high, excursion;
@@ -26,7 +27,10 @@ Axis yaw{1, 0, 0, 16, -1, -1, -1}, pitch{2, 0, 0, 12, -1, -1, -1};
 StateReader readState;
 std::atomic<const char*> status{"off"};
 std::atomic<bool> ready{false}, testPending{false};
+std::atomic<bool> conversationPosePending{false};
 std::atomic<unsigned> gestures{0}, failures{0};
+std::atomic<unsigned> conversationChecks{0};
+std::atomic<int> conversationFrom{-1}, conversationAt{-1};
 std::atomic<int> lastAxis{0}, lastStart{-1}, lastPeak{-1}, lastEnd{-1};
 std::atomic<int> lastRxBytes{0}, lastServoStatus{0};
 std::atomic<int> vmConfig{-1}, vmOut{-1}, vmIn{-1}, batteryMv{-1};
@@ -186,7 +190,7 @@ Result gesture(const Axis& a, int sign, bool test) {
   return Result::Done;
 }
 
-bool moveStandbyPitch(int target, std::atomic<int>& arrived) {
+bool movePitch(int target, std::atomic<int>& arrived) {
   if (!goal(pitch.id, target) || !torque(pitch.id, true)) {
     release(pitch.id);
     return false;
@@ -229,7 +233,10 @@ void run(void*) {
   unsigned phase = 0;
   uint32_t last = millis()-kBetweenGesturesMs;
   bool parked = false;
-  int wakePitch = -1;
+  const int lowestReachablePitch = std::max(pitch.rawLow, zeroPitch - 4);
+  const int uprightThreshold = pitch.low + kMinimumUprightOffset;
+  const int defaultUpright = std::min(pitch.high, pitch.low + kDefaultUprightOffset);
+  int wakePitch = defaultUpright;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(40));
     const bool test = testPending.exchange(false);
@@ -240,8 +247,7 @@ void run(void*) {
         const int current = position(pitch.id);
         // After a reset while parked, feedback may already report the sleep
         // angle. Use a calibrated wake pose when there is no higher pose to save.
-        wakePitch = current >= pitch.low + 16 && current <= pitch.high
-                        ? current : std::min(pitch.high, pitch.low + 48);
+        wakePitch = current >= uprightThreshold && current <= pitch.high ? current : defaultUpright;
         standbyFrom = current;
         standbyAt = wakeAt = -1;
         if (current >= pitch.low && current <= pitch.high) {
@@ -249,7 +255,7 @@ void run(void*) {
           const int target = pitch.low;
           if (target < current) {
             status = "parking";
-            if (!moveStandbyPitch(target, standbyAt)) {
+            if (!movePitch(target, standbyAt)) {
               disable("standby_pitch"); vTaskDelete(nullptr); return;
             }
           } else {
@@ -281,14 +287,34 @@ void run(void*) {
         disable("wake_torque_release"); vTaskDelete(nullptr); return;
       }
       const int current = position(pitch.id);
-      if (current < std::max(pitch.rawLow, zeroPitch - 4) || current > pitch.high) {
+      if (current < lowestReachablePitch || current > pitch.high) {
         disable("wake_pitch_range"); vTaskDelete(nullptr); return;
       }
-      if (!moveStandbyPitch(wakePitch, wakeAt)) {
+      if (!movePitch(wakePitch, wakeAt)) {
         disable("wake_pitch"); vTaskDelete(nullptr); return;
       }
       status = "ready";
       last = millis();
+      continue;
+    }
+    if (conversationPosePending.exchange(false)) {
+      int current = position(pitch.id);
+      if (current < 0) current = position(pitch.id);
+      conversationFrom = current;
+      conversationAt = current;
+      ++conversationChecks;
+      if (current < lowestReachablePitch || current > pitch.high) {
+        status = current < 0 ? "conversation_feedback" : "outside_range";
+        continue;
+      }
+      if (current < uprightThreshold) {
+        status = "raising_for_conversation";
+        if (!movePitch(wakePitch, conversationAt)) {
+          disable("conversation_pitch"); vTaskDelete(nullptr); return;
+        }
+        last = millis();
+      }
+      status = "ready";
       continue;
     }
     if (test ? state != State::Idle :
@@ -323,6 +349,8 @@ bool requestTest() {
   return ready && strcmp(status.load(), "moving") != 0 && !testPending.exchange(true);
 }
 
+void requestConversationPose() { conversationPosePending = true; }
+
 bool standbySettled() { return standbyParked.load() || !ready.load(); }
 
 void standbyStats(JsonObject out) {
@@ -349,6 +377,9 @@ void diagnostics(JsonObject out) {
   out["standby_from"] = standbyFrom.load();
   out["standby_at"] = standbyAt.load();
   out["wake_at"] = wakeAt.load();
+  out["conversation_checks"] = conversationChecks.load();
+  out["conversation_from"] = conversationFrom.load();
+  out["conversation_at"] = conversationAt.load();
   // Startup probe fields are immutable after init publishes ready or a fault.
   if (ready.load() || failures.load()) {
     for (const Axis* axis : {&yaw, &pitch}) {

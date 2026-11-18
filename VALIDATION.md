@@ -1,5 +1,9 @@
 # Validatie
 
+## Firmware v23 en kopstand bij gespreksstart — 18 november 2026
+
+De USB-upload is geverifieerd. Na een herstart stond het hoofd nog omlaag en was er in die firmwarestart nog geen slaapstand geweest. Bij een via USB gestart GPT Live-gesprek controleerde de servotaak de stand en ging de kantelpositie van 711 naar 758. Bij het volgende gesprek controleerde de servotaak opnieuw en bleef de positie 758. Beide gesprekken zijn afgesloten en de servo meldde geen fouten.
+
 ## Firmware v22 en wekken op batterij — 18 november 2026
 
 De USB-upload is geverifieerd. Bij overgang naar de zuinige stand krijgt de schermtaak de definitieve gespreksstatus, ook als de normale schermupdate vlak daarvoor is overgeslagen. Een vroege wekopdracht blijft beschikbaar totdat audio en de bridge gereed zijn. Op de fysieke StackChan registreerde de bridge meerdere nieuwe gesprekken na processorslaap op batterij, ook nadat ‘Ga slapen’ op batterij was uitgesproken. De servometingen bevestigden dat het hoofd omhoogkwam. De firmware meldde geen slaap- of servofouten.

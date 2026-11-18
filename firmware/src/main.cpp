@@ -479,6 +479,7 @@ bool startConversation() {
   wakeStartPending = false;
   operationSince = millis();
   status = "Verbinding met OpenAI...";
+  head::requestConversationPose();
   sendControl("start");
   return true;
 }
@@ -903,7 +904,7 @@ void setup() {
     return static_cast<int32_t>(echoUntil.load() - millis()) > 0 ?
         head::State::Speaking : head::State::Listening;
   });
-  Serial.println("STACKCHAN_READY v22");
+  Serial.println("STACKCHAN_READY v23");
 }
 
 void loop() {
