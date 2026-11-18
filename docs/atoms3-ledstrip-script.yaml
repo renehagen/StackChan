@@ -1,0 +1,76 @@
+stackchan_atoms3_ledstrip:
+  alias: StackChan AtomS3-ledstrip bedienen
+  description: Kies een AtomS3-effect of een vaste kleur. Een kleur schakelt eerst naar Solid.
+  mode: queued
+  fields:
+    effect:
+      name: Effect
+      description: Solid, Rainbow, Fire, Meteor of KITT. Kies effect of kleur.
+      selector:
+        select:
+          options:
+            - Solid
+            - Rainbow
+            - Fire
+            - Meteor
+            - KITT
+    color:
+      name: Vaste kleur
+      description: Engelse kleurnaam zoals green. Het script schakelt eerst naar Solid.
+      selector:
+        text: {}
+    brightness:
+      name: Helderheid
+      description: Optioneel percentage bij de gekozen kleur of het effect.
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+  sequence:
+    - variables:
+        effects:
+          solid: Solid
+          rainbow: Rainbow
+          fire: Fire
+          meteor: Meteor
+          kitt: KITT
+        requested_effect: "{{ effect | default('', true) | trim | lower }}"
+        requested_color: "{{ color | default('', true) | trim | lower }}"
+    - if:
+        - condition: template
+          value_template: >-
+            {{ (not requested_color and requested_effect not in effects)
+              or (requested_color and (requested_effect not in ['', 'solid']
+                or not (requested_color | regex_match('^[a-z]{1,30}$')))) }}
+      then:
+        - stop: Kies één geldig effect of één vaste kleur.
+          error: true
+    - variables:
+        target_effect: "{{ 'Solid' if requested_color else effects[requested_effect] }}"
+    - action: light.turn_on
+      target:
+        entity_id: light.atoms3_led_strip_2
+      data: >-
+        {{ {'effect': target_effect, 'brightness_pct': brightness | int}
+           if brightness is defined and not requested_color else {'effect': target_effect} }}
+    - wait_template: >-
+        {{ is_state('light.atoms3_led_strip_2', 'on')
+           and is_state_attr('light.atoms3_led_strip_2', 'effect', target_effect) }}
+      timeout: '00:00:04'
+    - if:
+        - condition: template
+          value_template: "{{ not wait.completed }}"
+      then:
+        - stop: De AtomS3 heeft de effectwissel niet bevestigd.
+          error: true
+    - if:
+        - condition: template
+          value_template: "{{ requested_color != '' }}"
+      then:
+        - action: light.turn_on
+          target:
+            entity_id: light.atoms3_led_strip_2
+          data: >-
+            {{ {'color_name': requested_color, 'brightness_pct': brightness | int}
+               if brightness is defined else {'color_name': requested_color} }}

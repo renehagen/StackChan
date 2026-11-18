@@ -14,6 +14,7 @@ platformio==6.2.0
 pyelftools==0.33
 pyserial==3.5
 requests==2.34.2
+PyYAML==6.0.3
 semantic-version==2.10.0
 starlette==0.46.2
 tabulate==0.10.0

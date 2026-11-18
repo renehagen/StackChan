@@ -310,6 +310,108 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         await self.client.execute("ha_GetLiveContext", incompatible)
         self.assertEqual(calls, [original, original, incompatible])
 
+    async def test_name_variants_resolve_through_real_assist_schema_before_a_single_action(self):
+        properties = {"name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "array"}}
+        for definition in self.fake.catalog[:2]:
+            definition["inputSchema"]["properties"].update(properties)
+        await self.client.initialize()
+        calls = []
+        catalog = ("Live Context: an overview\n"
+                   "- names: AtomS3 LED Strip, Strip bij tv\n  domain: light\n  areas: Woonkamer\n"
+                   "- names: Nano Shapes\n  domain: light\n  areas: Woonkamer\n"
+                   "- names: Leeslamp\n  domain: light\n  areas: Woonkamer\n"
+                   "- names: Leeslamp\n  domain: light\n  areas: Keuken\n"
+                   "- names: Frame TV 1\n  domain: media_player\n"
+                   "- names: Curtain Left\n  domain: cover\n")
+
+        async def rpc(method, params):
+            calls.append(params)
+            args = params["arguments"]
+            if params["name"] == "HassTurnOn":
+                return {"content": [{"type": "text", "text": "Lamp is on"}]}
+            if args.get("name") == "Atom S3 LED Strip":
+                return {"isError": True, "content": [{"type": "text", "text": "MatchFailedReason.NAME"}]}
+            return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": catalog})}]}
+
+        self.client._rpc = rpc
+        state = await self.client.execute("ha_GetLiveContext", {"name": "Atom S3 LED Strip"})
+        self.assertTrue(state["ok"])
+        self.assertEqual(state["resolved_name"], "AtomS3 LED Strip")
+        self.assertEqual([call["arguments"].get("name") for call in calls],
+                         ["Atom S3 LED Strip", None, "AtomS3 LED Strip"])
+        for name, expected in (("Atoms3 LED Strp", "AtomS3 LED Strip"), ("Stripbij-tv", "AtomS3 LED Strip"),
+                               ("NanoShaps", "Nano Shapes"), ("lamp-Nano  Shapes", "Nano Shapes")):
+            with self.subTest(name=name):
+                result = await self.client.execute("ha_FindTarget", {"name": name, "area": "Woon kamer"})
+                self.assertEqual(result["name"], expected)
+        self.assertEqual((await self.client.execute("ha_FindTarget", {"name": "Frame TV 2"}))["error"], "target_not_found")
+        self.assertEqual((await self.client.execute("ha_FindTarget", {"name": "Curtain Rechts"}))["error"], "target_not_found")
+        ambiguous = await self.client.execute("ha_HassTurnOn", {"name": "Lees lamp"})
+        self.assertEqual(ambiguous["error"], "target_ambiguous")
+        self.assertEqual({row["area"] for row in ambiguous["options"]}, {"Keuken", "Woonkamer"})
+        result = await self.client.execute("ha_HassTurnOn", {"name": "Atom S3 LED Strip"})
+        self.assertTrue(result["ok"])
+        self.assertEqual([call for call in calls if call["name"] == "HassTurnOn"], [{"name": "HassTurnOn",
+                              "arguments": {"name": "AtomS3 LED Strip", "area": "Woonkamer", "domain": ["light"]}}])
+        self.assertEqual(sum(call["arguments"] == {} for call in calls), 1)
+
+    async def test_scene_and_enabled_script_are_resolved_separately(self):
+        self.fake.catalog[0]["inputSchema"]["properties"]["name"] = {"type": "string"}
+        self.fake.catalog.extend([
+            {"name": "woonkamer_warm", "description": "Aliases: ['Sfeervol warm']",
+             "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "other_script", "description": "Aliases: ['Verborgen opdracht']",
+             "inputSchema": {"type": "object", "properties": {}}},
+        ])
+        client = HomeAssistantTools(self.path, scripts=("woonkamer_warm",))
+        client._opener = self.fake
+        await client.initialize()
+
+        async def rpc(method, params):
+            self.assertEqual(params, {"name": "GetLiveContext", "arguments": {}})
+            context = "- names: Woonkamer warm\n  domain: scene\n  areas: Woonkamer\n"
+            return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": context})}]}
+
+        client._rpc = rpc
+        script = await client.execute("ha_FindTarget", {"name": "Sfeervolwarm script", "domain": "script"})
+        self.assertEqual(script["tool"], "ha_script_woonkamer_warm")
+        scene = await client.execute("ha_FindTarget", {"name": "Woon kamer warm scène", "domain": "scene"})
+        self.assertEqual((scene["name"], scene["domain"]), ("Woonkamer warm", "scene"))
+        self.assertNotIn("tool", scene)
+        self.assertEqual((await client.execute("ha_FindTarget", {"name": "Woonkamerwarm"}))["error"], "target_ambiguous")
+        self.assertEqual((await client.execute("ha_FindTarget", {"name": "Verborgen opdracht", "domain": "script"}))["error"],
+                         "target_not_found")
+
+    async def test_atoms3_color_uses_the_configured_script_once(self):
+        self.fake.catalog[0]["inputSchema"]["properties"]["name"] = {"type": "string"}
+        properties = {"name": {"type": "string"}, "color": {"type": "string"},
+                      "brightness": {"type": "integer"}, "area": {"type": "string"}}
+        self.fake.catalog.extend([
+            {"name": "HassLightSet", "inputSchema": {"type": "object", "properties": properties}},
+            {"name": "stackchan_atoms3_ledstrip", "inputSchema": {"type": "object", "properties": {}}},
+        ])
+        client = HomeAssistantTools(self.path, scripts=("stackchan_atoms3_ledstrip",))
+        client._opener = self.fake
+        await client.initialize()
+        calls = []
+        async def rpc(method, params):
+            if params["name"] == "GetLiveContext":
+                context = ("- names: AtomS3 LED Strip\n  domain: light\n  areas: Woonkamer\n"
+                           "- names: Leeslamp\n  domain: light\n  areas: Woonkamer\n")
+                return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": context})}]}
+            calls.append(params)
+            return {"content": [{"type": "text", "text": "Done"}]}
+
+        client._rpc = rpc
+        result = await client.execute("ha_HassLightSet", {"name": "Atom S3 led-strip", "color": "green", "brightness": 45})
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [{"name": "stackchan_atoms3_ledstrip", "arguments": {"color": "green", "brightness": 45}}])
+        self.assertEqual(result["via_tool"], "ha_script_stackchan_atoms3_ledstrip")
+        await client.execute("ha_HassLightSet", {"name": "Leeslamp", "color": "green"})
+        await client.execute("ha_HassLightSet", {"name": "AtomS3 LED Strip", "brightness": 45})
+        await client.execute("ha_HassLightSet", {"name": "AtomS3 LED Strip", "color": "green", "area": "Garage"})
+        self.assertEqual([call["name"] for call in calls[1:]], ["HassLightSet"] * 3)
+
     async def test_auth_and_missing_integration_errors_are_sanitized(self):
         await self.client.initialize()
         for status, code in [(401, "authentication_required"), (403, "permission_denied"), (404, "assist_mcp_not_configured")]:

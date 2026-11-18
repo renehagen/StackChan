@@ -6,6 +6,7 @@ configured HA origin. There is deliberately no REST service-call fallback.
 from __future__ import annotations
 
 import asyncio
+from ast import literal_eval
 import copy
 import hashlib
 from http.client import HTTPException
@@ -23,6 +24,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+if __package__:
+    from .ha_names import Target, context_targets, find_targets, name_key
+else:
+    from ha_names import Target, context_targets, find_targets, name_key
+
 
 PROTOCOL_VERSION = "2025-03-26"
 MAX_BODY = 1024 * 1024
@@ -33,6 +39,12 @@ TARGET_CACHE_TTL = 3 * 86400
 ALIAS_LIMIT = 32
 TARGET_DOMAINS = frozenset({"light", "switch", "scene", "fan", "climate", "media_player", "script"})
 SAVE_ALIAS_TOOL = "ha_SaveAlias"
+FIND_TARGET_TOOL = "ha_FindTarget"
+ATOMS3_TOOL = "ha_script_stackchan_atoms3_ledstrip"
+ATOMS3_NAME = "AtomS3 LED Strip"
+CATALOG_TTL = 45
+TOOL_DOMAINS = {"ha_HassLightSet": "light", "ha_HassClimateSetTemperature": "climate",
+                "ha_HassFanSetSpeed": "fan", "ha_HassSetVolume": "media_player"}
 # These are device/read intents. Administrative, messaging and security tools
 # are not added merely because a future server offers them.
 ASSIST_TOOLS = frozenset({
@@ -252,6 +264,10 @@ def _target_label(value: Any) -> str | None:
     return None
 
 
+def _spoken_label(value: Any) -> str | None:
+    return _target_label(" ".join(value.split())) if isinstance(value, str) else None
+
+
 def _alias_key(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -274,6 +290,15 @@ def _lookup_without_suffix(arguments: dict[str, Any]) -> dict[str, Any] | None:
     if arguments.get("domain") not in (None, domain, [domain]):
         return None
     return {**arguments, "name": candidate, "domain": domain}
+
+
+def _domains(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return ()
+    choices = [value] if isinstance(value, str) else value
+    if not isinstance(choices, list) or not all(isinstance(x, str) and re.fullmatch(r"[a-z_]+", x) for x in choices):
+        return None
+    return tuple(choices)
 
 
 class HomeAssistantTools:
@@ -299,6 +324,9 @@ class HomeAssistantTools:
         self._protocol = PROTOCOL_VERSION
         self._request_id = 0
         self._tools: dict[str, dict[str, Any]] = {}
+        self._catalog_lock = asyncio.Lock()
+        self._catalog_rows: list[Target] = []
+        self._catalog_until = 0.0
 
     def _http(self, path: str, body: bytes, *, form: bool = False,
               request_id: int | None = None) -> tuple[Any, str | None]:
@@ -422,6 +450,16 @@ class HomeAssistantTools:
             raise HomeAssistantError("tool_catalog_too_large")
         if not tools:
             raise HomeAssistantError("no_exposed_assist_tools")
+        if "name" in tools.get("ha_GetLiveContext", {}).get("parameters", {}).get("properties", {}):
+            tools[FIND_TARGET_TOOL] = {
+                "type": "function", "name": FIND_TARGET_TOOL, "strict": False,
+                "description": ("Find one exposed Home Assistant device, scene or enabled script by its spoken name, "
+                                "including spacing variants and small typos. This is a read-only lookup. Use domain "
+                                "script or scene when specified, and use the returned exact name or script tool."),
+                "parameters": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "string"},
+                }, "required": ["name"], "additionalProperties": False},
+            }
         if self._cache_path and "ha_GetLiveContext" in tools:
             tools[SAVE_ALIAS_TOOL] = {
                 "type": "function", "name": SAVE_ALIAS_TOOL, "strict": False,
@@ -436,11 +474,82 @@ class HomeAssistantTools:
                 }, "required": ["alias", "target"], "additionalProperties": False},
             }
         self._tools = tools
+        self._catalog_until = 0.0
         if self._cache_path:
             self._targets, self._aliases = await asyncio.to_thread(self._load_targets)
 
     def definitions(self) -> list[dict[str, Any]]:
         return copy.deepcopy(list(self._tools.values()))
+
+    def _script_targets(self) -> list[Target]:
+        targets = []
+        for name, definition in self._tools.items():
+            if not name.startswith("ha_script_"):
+                continue
+            names = [name.removeprefix("ha_script_").replace("_", " ")]
+            if match := re.search(r"\bAliases:\s*(\[[^\n]*\])", definition["description"]):
+                try:
+                    aliases = literal_eval(match[1])
+                except (SyntaxError, ValueError):
+                    aliases = []
+                if isinstance(aliases, list):
+                    names = [label for label in aliases if _target_label(label)] + names
+            targets.append(Target(tuple(names), "script", tool=name))
+        return targets
+
+    async def _target_catalog(self) -> list[Target]:
+        async with self._catalog_lock:
+            if time.monotonic() < self._catalog_until:
+                return self._catalog_rows
+            result = await self._rpc("tools/call", {"name": "GetLiveContext", "arguments": {}})
+            if not isinstance(result, dict) or result.get("isError"):
+                return []
+            rows = []
+            content = result.get("content")
+            for item in content if isinstance(content, list) else ():
+                try:
+                    payload = json.loads(item["text"])
+                except (TypeError, KeyError, ValueError):
+                    continue
+                if isinstance(payload, dict) and payload.get("success") is True and isinstance(payload.get("result"), str):
+                    rows.extend(context_targets(payload["result"]))
+            if rows:
+                self._catalog_rows = rows
+                self._catalog_until = time.monotonic() + CATALOG_TTL
+            return rows
+
+    async def _find_target(self, name: str, domains: tuple[str, ...] = (), area: str | None = None) -> dict[str, Any]:
+        candidates = [] if domains and set(domains) == {"script"} else await self._target_catalog()
+        matches = find_targets(name, candidates + self._script_targets(), domains=domains, area=area)
+        if len(matches) == 1:
+            return {"ok": True, **matches[0].reference()}
+        if matches:
+            return {"ok": False, "error": "target_ambiguous", "options": [row.reference() for row in matches[:5]],
+                    "feedback": "Meerdere doelen komen overeen. Vraag welk apparaat, script of welke scène is bedoeld."}
+        return {"ok": False, "error": "target_not_found", "feedback": "Geen eenduidige vrijgegeven naam gevonden."}
+
+    async def _resolve_operation(self, tool: str, arguments: dict[str, Any], label: str,
+                                 domains: tuple[str, ...], area: str | None) -> dict[str, Any]:
+        # Assist's overview contains no floor or device class, so leave those
+        # filters to HA. Never send an action as part of name resolution.
+        if arguments.keys() & {"floor", "device_class"}:
+            return {}
+        intrinsic = TOOL_DOMAINS.get(tool, "media_player" if tool.startswith("ha_HassMedia") else None)
+        if intrinsic and domains not in ((), (intrinsic,)):
+            return {}
+        scope = domains or ((intrinsic,) if intrinsic else tuple(sorted(TARGET_DOMAINS - {"script"})))
+        if "script" in scope:
+            return {}
+        return await self._find_target(label, scope, area)
+
+    def _named_arguments(self, name: str, arguments: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+        rewritten = {**arguments, "name": target["name"]}
+        properties = self._tools[name]["parameters"].get("properties", {})
+        if target.get("area") and "area" in properties:
+            rewritten["area"] = target["area"]
+        if "domain" in properties:
+            rewritten["domain"] = [target["domain"]] if properties["domain"].get("type") == "array" else target["domain"]
+        return rewritten
 
     @staticmethod
     def _target_key(entry: dict[str, Any]) -> tuple[str, ...]:
@@ -544,6 +653,11 @@ class HomeAssistantTools:
             return {"ok": False, "error": "invalid_alias"}
         if domain == "script":
             script = "ha_script_" + re.sub(r"[ -]+", "_", target.casefold())
+            if not area and script not in self._tools and FIND_TARGET_TOOL in self._tools:
+                match = await self._find_target(target, ("script",))
+                if match.get("error") == "target_ambiguous":
+                    return match
+                script = match.get("tool", script)
             if area or script not in self._tools:
                 return {"ok": False, "error": "alias_target_unavailable"}
             target = script.removeprefix("ha_script_")
@@ -602,12 +716,7 @@ class HomeAssistantTools:
         else:
             properties = self._tools[tool]["parameters"].get("properties", {})
             if "domain" not in properties:
-                intrinsic_domain = {
-                    "ha_HassLightSet": "light",
-                    "ha_HassClimateSetTemperature": "climate",
-                    "ha_HassFanSetSpeed": "fan",
-                    "ha_HassSetVolume": "media_player",
-                }.get(tool, "media_player" if tool.startswith("ha_HassMedia") else None)
+                intrinsic_domain = TOOL_DOMAINS.get(tool, "media_player" if tool.startswith("ha_HassMedia") else None)
                 if intrinsic_domain != domain:
                     return {"ok": False, "error": "alias_scope_mismatch", "saved_alias": entry}
             rewritten = {**arguments, "name": name}
@@ -615,11 +724,23 @@ class HomeAssistantTools:
                 rewritten["domain"] = [domain] if properties["domain"].get("type") == "array" else domain
             if area and "area" in properties:
                 rewritten["area"] = area
-            result = await self.execute(tool, rewritten, _suffix_fallback=False, _resolve_alias=False)
+            color_args = self._atoms3_color_arguments(tool, rewritten, entry)
+            if color_args is not None:
+                result = {**await self.execute(ATOMS3_TOOL, color_args), "via_tool": ATOMS3_TOOL}
+            else:
+                result = await self.execute(tool, rewritten, _suffix_fallback=False, _resolve_alias=False, _resolve_name=False)
         return {**result, "resolved_name": name, "resolved_domain": domain}
 
+    def _atoms3_color_arguments(self, tool: str, arguments: dict[str, Any],
+                                target: dict[str, Any]) -> dict[str, Any] | None:
+        if (ATOMS3_TOOL in self._tools and tool == "ha_HassLightSet" and target["domain"] == "light"
+                and name_key(target["name"]) == name_key(ATOMS3_NAME) and arguments.get("color")
+                and arguments.get("brightness") != 0 and not arguments.keys() & {"floor", "device_class", "temperature"}):
+            return {key: arguments[key] for key in ("color", "brightness") if key in arguments}
+        return None
+
     async def execute(self, name: str, arguments: dict[str, Any], *, _suffix_fallback: bool = True,
-                      _resolve_alias: bool = True) -> dict[str, Any]:
+                      _resolve_alias: bool = True, _resolve_name: bool = True) -> dict[str, Any]:
         if name not in self._tools:
             return {"ok": False, "error": "unknown_home_assistant_tool"}
         try:
@@ -629,10 +750,40 @@ class HomeAssistantTools:
                 return {"ok": False, "error": "invalid_tool_arguments"}
             if name == SAVE_ALIAS_TOOL:
                 return await self._save_alias(arguments)
-            if _resolve_alias and not name.startswith("ha_script_"):
-                alias = self._aliases.get(_alias_key(arguments.get("name")))
+            label = _spoken_label(arguments.get("name"))
+            area = _spoken_label(arguments.get("area"))
+            domains = _domains(arguments.get("domain"))
+            valid_scope = domains is not None and (arguments.get("area") is None or bool(area))
+            alias = self._aliases.get(_alias_key(label)) if _resolve_alias and not name.startswith("ha_script_") else None
+            if name == FIND_TARGET_TOOL:
+                if not label or not valid_scope or set(arguments) - {"name", "area", "domain"}:
+                    return {"ok": False, "error": "invalid_tool_arguments"}
                 if alias:
-                    return await self._execute_alias(name, arguments, alias)
+                    if (domains and alias["domain"] not in domains) or (area and alias["area"] and name_key(area) != name_key(alias["area"])):
+                        return {"ok": False, "error": "alias_scope_mismatch"}
+                    reference = {k: alias[k] for k in ("name", "area", "domain")}
+                    if alias["domain"] == "script":
+                        script = "ha_script_" + alias["name"]
+                        if script not in self._tools:
+                            return {"ok": False, "error": "alias_target_unavailable"}
+                        reference["tool"] = script
+                    return {"ok": True, **reference, "resolved_name": alias["name"], "resolved_domain": alias["domain"]}
+                return await self._find_target(label, domains, area)
+            if alias:
+                return await self._execute_alias(name, arguments, alias)
+            resolved = None
+            can_resolve = _resolve_name and FIND_TARGET_TOOL in self._tools and label and valid_scope
+            if can_resolve and name != "ha_GetLiveContext" and not name.startswith("ha_script_"):
+                candidate = await self._resolve_operation(name, arguments, label, domains, area)
+                if candidate.get("error") == "target_ambiguous":
+                    return candidate
+                if candidate.get("ok"):
+                    color_args = self._atoms3_color_arguments(name, arguments, candidate)
+                    if color_args is not None:
+                        return {**await self.execute(ATOMS3_TOOL, color_args), "via_tool": ATOMS3_TOOL,
+                                "resolved_name": candidate["name"], "resolved_domain": "light"}
+                    arguments = self._named_arguments(name, arguments, candidate)
+                    resolved = candidate
             prefix = "ha_script_" if name.startswith("ha_script_") else "ha_"
             result = await self._rpc("tools/call", {"name": name[len(prefix):], "arguments": arguments})
             if not isinstance(result, dict):
@@ -679,17 +830,30 @@ class HomeAssistantTools:
                     match = re.search(r"MatchFailedReason\.(NAME|AREA)\b|No exposed entities matched (name|area)\b", detail, re.I)
                     if match:
                         field = (match[1] or match[2]).lower()
-                        label = "apparaatnaam" if field == "name" else "ruimte"
-                        output["feedback"] = f"Home Assistant vond geen overeenkomst voor de opgegeven {label}."
-                        if name == "ha_GetLiveContext" and field == "name" and _suffix_fallback:
+                        field_label = "apparaatnaam" if field == "name" else "ruimte"
+                        output["feedback"] = f"Home Assistant vond geen overeenkomst voor de opgegeven {field_label}."
+                        if name == "ha_GetLiveContext" and field == "name" and _suffix_fallback and not can_resolve:
                             shortened = _lookup_without_suffix(arguments)
                             if shortened:
-                                retry = await self.execute(name, shortened, _suffix_fallback=False, _resolve_alias=_resolve_alias)
+                                retry = await self.execute(name, shortened, _suffix_fallback=False,
+                                                           _resolve_alias=_resolve_alias, _resolve_name=False)
                                 if retry.get("ok"):
                                     return {**retry, "resolved_name": shortened["name"],
                                             "resolved_domain": shortened["domain"]}
                     if (match or detail == "no_valid_targets") and (target := _target_label(arguments.get("name"))):
                         await self._update_targets(remove=(target, _target_label(arguments.get("area"))))
+                if (can_resolve and name == "ha_GetLiveContext"
+                        and (match or detail and re.fullmatch(r"Area '.*' does not exist", detail))):
+                    target = await self._find_target(label, domains, area)
+                    if target.get("tool"):
+                        return target  # Scripts are catalogue tools, not state entities.
+                    if target.get("ok"):
+                        rewritten = self._named_arguments(name, arguments, target)
+                        retry = await self.execute(name, rewritten, _resolve_alias=False, _resolve_name=False,
+                                                   _suffix_fallback=False)
+                        return {**retry, "resolved_name": target["name"], "resolved_domain": target["domain"]}
+                    if target.get("error") == "target_ambiguous":
+                        return {**output, **target}
                 return output
             text = "\n".join(rendered)
             output: dict[str, Any] = {"ok": True, "text": text[:MAX_OUTPUT]}
@@ -702,6 +866,8 @@ class HomeAssistantTools:
             if confirmed:
                 await self._update_targets(entry=confirmed)
                 output["confirmed_target"] = confirmed
+            if resolved:
+                output.update(resolved_name=resolved["name"], resolved_domain=resolved["domain"])
             return output
         except HomeAssistantError as error:
             return {"ok": False, "error": str(error), **({"ha_detail": error.detail} if error.detail else {})}

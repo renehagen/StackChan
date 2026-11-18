@@ -1,5 +1,15 @@
 # Validatie
 
+## AtomS3-effecten via StackChan — 18 november 2026
+
+Het AtomS3-script is toegevoegd aan `/config/scripts.yaml`, gevalideerd met `check_config`, herladen en vrijgegeven aan Assist. De fysieke StackChan voerde via de Mac mini de gesproken opdracht voor groen uit. De scripttrace van 10:09:56 toont de actie `effect: Solid`, de bevestiging van de effectwissel en daarna `color_name: green`. De ledstrip ging van `Fire` naar `Solid`. Home Assistant rapporteerde RGB `[0, 128, 0]` en helderheid 207 na de proef. De sessieafsluiting is bevestigd.
+
+## Home Assistant-naamsmatching — 18 november 2026
+
+Alle 92 regressietests slaagden. De live Assist-catalogus op de Mac mini leverde `AtomS3 LED Strip` op voor `Atom S3 led strip` én `AtomS3 led strp`. Ook `NanoShaps` en de twee gelijknamige doelen `Woonkamer warm` zijn opgezocht. De expliciete keuze tussen script en scène leverde telkens het juiste type op. De regressietests controleren daarnaast dat een ambigue naam geen bedieningsoproep verstuurt en dat modelnummers niet door elkaar worden gehaald.
+
+De actieve bridge verwerkte een gesproken naamzoekopdracht voor `Atom S3 LED-strip` als een alleen-lezen zoekactie en vond `AtomS3 LED Strip`. De directe statusvraag met een spatievariant werkte. In de akoestische proeven gaf één statusvraag een verbindingsfout. Een eerdere vraag leidde tot een aanzetopdracht terwijl de ledstrip al aan stond. Daarop zijn de instructies voor statusvragen aangescherpt.
+
 ## Firmware v23 en kopstand bij gespreksstart — 18 november 2026
 
 De USB-upload is geverifieerd. Na een herstart stond het hoofd nog omlaag en was er in die firmwarestart nog geen slaapstand geweest. Bij een via USB gestart GPT Live-gesprek controleerde de servotaak de stand en ging de kantelpositie van 711 naar 758. Bij het volgende gesprek controleerde de servotaak opnieuw en bleef de positie 758. Beide gesprekken zijn afgesloten en de servo meldde geen fouten.

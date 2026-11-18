@@ -45,6 +45,10 @@ Home Assistant wordt apart aangemeld via `scripts/connect_home_assistant.py`. Op
 
 Scripts die in Home Assistant voor Assist zijn vrijgegeven verschijnen als aparte functies. Zet de gekozen objectnamen zonder `script.` als kommagescheiden lijst in `STACKCHAN_HA_SCRIPTS` in `.env.local`. Start de bridge opnieuw om zijn gereedschapslijst te laden. Gebruik een expliciete opdracht, bijvoorbeeld ‘Start het script Avondlicht’.
 
+Voor de AtomS3-ledstrip gebruikt StackChan het [AtomS3-script](docs/atoms3-ledstrip-script.yaml). Voeg het toe aan `scripts.yaml`, herlaad de scripts, geef `script.stackchan_atoms3_ledstrip` vrij aan Assist en voeg `stackchan_atoms3_ledstrip` toe aan `STACKCHAN_HA_SCRIPTS`. Zeg bijvoorbeeld ‘Zet het effect van de AtomS3-ledstrip op Rainbow’ of ‘Zet de AtomS3-ledstrip op groen’. Bij een vaste kleur wacht het script op de bevestiging van `Solid` en stelt daarna de kleur in.
+
+De bridge vergelijkt gesproken namen met de vrijgegeven namen en aliassen uit Assist en de ingestelde scripttools. Spaties, leestekens, accenten en kleine typefouten mogen afwijken. Geef bij gelijknamige doelen zo nodig de ruimte of het soort, bijvoorbeeld lamp, script of scène. Bij vergelijkbare matches vraagt StackChan welke je bedoelt. Bij een gevonden schrijfvariant gebruikt de bridge de vrijgegeven naam voor de bediening.
+
 De bridge onthoudt maximaal 32 bevestigde opdrachten voor één benoemd apparaat, één scène of een vrijgegeven script. Bij een exacte match op hetzelfde type opdracht kan StackChan de zoekstap overslaan. Home Assistant voert de opdracht opnieuw uit. De cache bewaart alleen naam, ruimte, domein, soort opdracht en vervaldatum in `.local/ha-target-cache.json`. Een doel vervalt na drie dagen of na een mislukte naam- of ruimtematch. Voor een actuele status vraagt StackChan Home Assistant.
 
 Bij een naam zoals ‘Eettafel lamp’ of ‘eettafellamp’ telt ook ‘Eettafel’ mee. Een volledige naam krijgt voorrang. Het soortwoord beheerst het domein van de verkorte zoekopdracht. ‘Woonkamer warm script’ en ‘Woonkamer warm scène’ verwijzen daardoor naar elk hun eigen type doel.
