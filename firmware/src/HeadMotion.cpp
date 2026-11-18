@@ -30,6 +30,19 @@ std::atomic<unsigned> gestures{0}, failures{0};
 std::atomic<int> lastAxis{0}, lastStart{-1}, lastPeak{-1}, lastEnd{-1};
 std::atomic<int> lastRxBytes{0}, lastServoStatus{0};
 std::atomic<int> vmConfig{-1}, vmOut{-1}, vmIn{-1}, batteryMv{-1};
+std::atomic<int> standbyFrom{-1}, standbyAt{-1}, wakeAt{-1};
+std::atomic<bool> standbyParked{false};
+
+bool setServoPower(bool on) {
+  auto& bus = M5.In_I2C;
+  constexpr uint8_t latch = 0x05, enable = 1;
+  const bool written = on ? bus.bitOn(kExpander, latch, enable, kI2cHz) :
+                           bus.bitOff(kExpander, latch, enable, kI2cHz);
+  uint8_t value = 0;
+  const bool read = bus.readRegister(kExpander, latch, &value, 1, kI2cHz);
+  vmOut = read ? value : -1;
+  return written && read && ((value & enable) != 0) == on;
+}
 
 bool setupBus() {
   auto& i2c = M5.In_I2C;
@@ -50,7 +63,7 @@ bool setupBus() {
   if (uart_param_config(kPort, &cfg) != ESP_OK ||
       uart_set_pin(kPort, 6, 7, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) return false;
   return i2c.bitOn(kExpander, 0x03, 1, kI2cHz) && i2c.bitOff(kExpander, 0x0b, 1, kI2cHz) &&
-         i2c.bitOn(kExpander, 0x09, 1, kI2cHz) && i2c.bitOn(kExpander, 0x05, 1, kI2cHz);
+         i2c.bitOn(kExpander, 0x09, 1, kI2cHz) && setServoPower(true);
 }
 
 bool sendPacket(uint8_t id, uint8_t op, const uint8_t* args, size_t count) {
@@ -125,14 +138,15 @@ bool release(uint8_t id) {
 }
 
 void disable(const char* reason) {
-  ready = false;
   status = reason;
   failures++;
-  M5.In_I2C.bitOff(kExpander, 0x05, 1, kI2cHz);
+  setServoPower(false);
+  ready = false;
 }
 
 bool keepGoing(bool test) {
-  return (readState() == State::Idle) == test;
+  const auto state = readState();
+  return state != State::Sleeping && (state == State::Idle) == test;
 }
 
 bool waitForServo(bool test) {
@@ -172,6 +186,17 @@ Result gesture(const Axis& a, int sign, bool test) {
   return Result::Done;
 }
 
+bool moveStandbyPitch(int target, std::atomic<int>& arrived) {
+  if (!goal(pitch.id, target) || !torque(pitch.id, true)) {
+    release(pitch.id);
+    return false;
+  }
+  vTaskDelay(pdMS_TO_TICKS(kLegMs + 150));
+  const int actual = position(pitch.id);
+  arrived = actual;
+  return release(pitch.id) && actual >= 0 && abs(actual - target) <= 8;
+}
+
 void run(void*) {
   status = "initializing";
   if (!setupBus()) { disable("power_or_uart"); vTaskDelete(nullptr); return; }
@@ -203,10 +228,69 @@ void run(void*) {
   ready = true;
   unsigned phase = 0;
   uint32_t last = millis()-kBetweenGesturesMs;
+  bool parked = false;
+  int wakePitch = -1;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(40));
     const bool test = testPending.exchange(false);
     const auto state = readState();
+    if (state == State::Sleeping) {
+      if (!parked) {
+        parked = true;
+        const int current = position(pitch.id);
+        // After a reset while parked, feedback may already report the sleep
+        // angle. Use a calibrated wake pose when there is no higher pose to save.
+        wakePitch = current >= pitch.low + 16 && current <= pitch.high
+                        ? current : std::min(pitch.high, pitch.low + 48);
+        standbyFrom = current;
+        standbyAt = wakeAt = -1;
+        if (current >= pitch.low && current <= pitch.high) {
+          // The calibrated 5-degree minimum is already inside the mechanical range.
+          const int target = pitch.low;
+          if (target < current) {
+            status = "parking";
+            if (!moveStandbyPitch(target, standbyAt)) {
+              disable("standby_pitch"); vTaskDelete(nullptr); return;
+            }
+          } else {
+            standbyAt = current;
+          }
+        }
+        if (!setServoPower(false)) {
+          disable("standby_power"); vTaskDelete(nullptr); return;
+        }
+        status = "standby";
+        standbyParked = true;
+      }
+      continue;
+    }
+    if (parked) {
+      parked = false;
+      standbyParked = false;
+      status = "waking";
+      if (!setServoPower(true)) {
+        disable("wake_power"); vTaskDelete(nullptr); return;
+      }
+      bool released = false;
+      // The servos need time to boot after their supply is restored.
+      for (unsigned attempt = 0; attempt < 6; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (release(yaw.id) && release(pitch.id)) { released = true; break; }
+      }
+      if (!released) {
+        disable("wake_torque_release"); vTaskDelete(nullptr); return;
+      }
+      const int current = position(pitch.id);
+      if (current < std::max(pitch.rawLow, zeroPitch - 4) || current > pitch.high) {
+        disable("wake_pitch_range"); vTaskDelete(nullptr); return;
+      }
+      if (!moveStandbyPitch(wakePitch, wakeAt)) {
+        disable("wake_pitch"); vTaskDelete(nullptr); return;
+      }
+      status = "ready";
+      last = millis();
+      continue;
+    }
     if (test ? state != State::Idle :
         state != State::Speaking || millis()-last < kBetweenGesturesMs) continue;
     last = millis();
@@ -239,6 +323,15 @@ bool requestTest() {
   return ready && strcmp(status.load(), "moving") != 0 && !testPending.exchange(true);
 }
 
+bool standbySettled() { return standbyParked.load() || !ready.load(); }
+
+void standbyStats(JsonObject out) {
+  out["head_faults"] = failures.load();
+  const int asleep = standbyAt.load(), awake = wakeAt.load();
+  if (asleep >= 0) out["head_standby_at"] = asleep;
+  if (awake >= 0) out["head_wake_at"] = awake;
+}
+
 void diagnostics(JsonObject out) {
   out["status"] = status.load();
   out["count"] = gestures.load();
@@ -253,6 +346,9 @@ void diagnostics(JsonObject out) {
   out["vm_latch"] = vmOut.load();
   out["vm_pins"] = vmIn.load();
   out["battery_mv"] = batteryMv.load();
+  out["standby_from"] = standbyFrom.load();
+  out["standby_at"] = standbyAt.load();
+  out["wake_at"] = wakeAt.load();
   // Startup probe fields are immutable after init publishes ready or a fault.
   if (ready.load() || failures.load()) {
     for (const Axis* axis : {&yaw, &pitch}) {

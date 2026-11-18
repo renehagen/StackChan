@@ -2,14 +2,16 @@
 
 Firmwareprototype voor de **officiële M5Stack StackChan met CoreS3**, met Nederlandse spraakgesprekken via **OpenAI `gpt-live-1`**. Een lokale Python-bridge op de Mac verbindt de robot met OpenAI. Die Mac moet tijdens gesprekken aanstaan en op hetzelfde bereikbare netwerk zitten. De OpenAI-sleutel blijft op de Mac.
 
-In stand-by staat **Gesprek gestopt** in het midden. Tijdens luisteren en spreken toont het scherm andere audiogolven. Onderin staan de microfoon, het volume en de gespreksknop. Tijdens een gesproken antwoord draait of knikt het hoofd af en toe.
+Na afloop van een gesprek staat **Gesprek gestopt** in het midden tot de slaapstand ingaat. Tijdens luisteren en spreken toont het scherm andere audiogolven. Onderin staan de microfoon, het volume en de gespreksknop. Tijdens een gesproken antwoord draait of knikt het hoofd af en toe.
 
 Zie [VALIDATION.md](VALIDATION.md) voor de regressietests, buildgegevens en de precieze grenzen van de verificatie. Maak bij een andere bridgecomputer of gewijzigde hostnaam een nieuw certificaat met `--renew`.
 
 ## Bediening
 
-Tijdens een gesprek verdwijnen de knoppen na 10 seconden zonder aanraking. Tik ergens op het scherm om ze opnieuw 10 seconden te tonen. De eerste tik toont alleen de knoppen. Na afloop blijft Start in beeld.
+Tijdens een gesprek verdwijnen de knoppen na 10 seconden zonder aanraking. Tik ergens op het scherm om ze opnieuw 10 seconden te tonen. De eerste tik toont alleen de knoppen. Na afloop blijft Start in beeld tot de slaapstand ingaat.
 
+- Na één minuut zonder gesprek of aanraking gaat het scherm uit en kantelt het hoofd naar de laagste gekalibreerde stand. Zeg tijdens een gesprek **‘Ga slapen’** of **‘Ga in slaapstand’** om het scherm meteen uit te zetten en het hoofd te laten zakken terwijl de bridge het gesprek afsluit. Op batterij gaan daarna wifi, audio en servovoeding uit en slaapt de processor tussen korte aanraakcontroles. Op USB-voeding blijven wifi, de bridgeverbinding en audio gereed. Strijk bovenop of tik op het scherm om de StackChan te wekken. Het hoofd komt omhoog, het scherm gaat aan op 30% en er start automatisch een gesprek zodra de bridge bereikbaar is. Spreek zodra de microfoon rechts verschijnt.
+- Op batterij staat het laadpercentage rechts in de bovenbalk naast het wifi-icoon.
 - Tik rechtsonder op **Start**. Spreek zodra de microfoon rechts verschijnt.
 - **Stop** stopt de lokale audio en sluit de OpenAI-sessie af.
 - Met **Demp** linksonder zet je de microfoon stil. Tik op **Mic aan** om verder te praten.

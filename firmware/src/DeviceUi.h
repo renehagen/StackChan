@@ -9,6 +9,7 @@
 
 enum class UiCommand : uint8_t {
   StartSession,
+  WakeSession,
   StopSession,
   Mute,
   Unmute,
@@ -24,6 +25,7 @@ struct UiSnapshot {
   bool closing = false;
   bool connected = false;
   bool wifiConnected = false;
+  int8_t batteryPercent = -1;
   uint8_t volume = 90;
   bool speaking = false;
   char status[80]{};
@@ -51,6 +53,10 @@ class DeviceUi {
   int listeningWaveHeight() const { return paintedWaveHeight_.load(std::memory_order_relaxed); }
   uint32_t speakingWaveFrames() const { return speakingWaveFrames_.load(std::memory_order_relaxed); }
   bool controlsVisible() const { return controlsVisible_.load(); }
+  bool sleeping() const { return sleeping_.load(); }
+  void requestSleep() { sleepRequested_ = true; }
+  bool topTouchReady() const { return topTouchReady_.load(); }
+  uint32_t topWakes() const { return topWakes_.load(std::memory_order_relaxed); }
   uint8_t panelButtonMask() const { return panelButtonMask_.load(); }
   bool ready() const { return ready_.load(std::memory_order_acquire); }
   uint32_t maxRenderMs() const {
@@ -93,6 +99,8 @@ class DeviceUi {
   // Render history and volume panel belong exclusively to the display task.
   UiSnapshot painted_{};
   bool firstPaint_ = true;
+  std::atomic<bool> sleeping_{false}, sleepRequested_{false}, topTouchReady_{false};
+  std::atomic<uint32_t> topWakes_{0};
   std::atomic<bool> controlsVisible_{true};
   std::atomic<uint8_t> panelButtonMask_{0};
   uint32_t controlsTouchedAt_ = 0;

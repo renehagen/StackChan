@@ -45,20 +45,16 @@ UPSTREAM_URL = "wss://api.openai.com/v1/live/sessions"
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640
 MAX_TOOL_RESULT_BYTES = 64 * 1024
-VOICE_CONTROL_TOOL = {
-    "type": "function", "name": "stackchan_control", "strict": False,
-    "description": ("Control this StackChan robot when the user explicitly asks to end its conversation, "
-                    "change its speaker volume, or mute its microphone."),
-    "parameters": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["stop", "volume", "mute"]},
-        "percent": {"type": "integer", "minimum": 0, "maximum": 100},
-    }, "required": ["action"], "additionalProperties": False},
-}
+VOICE_CONTROL_NAME = "stackchan_control"
 VOICE_CONTROL_INSTRUCTIONS = (
     "Als de gebruiker expliciet vraagt om dit StackChan-gesprek te stoppen, zijn volume in te stellen "
     "of zijn microfoon te dempen, roep meteen stackchan_control aan. Gebruik stop voor 'stop het gesprek', "
     "mute voor 'demp de microfoon', en volume met percent voor 'zet je volume op 70 procent'. "
     "Een mediaplayer of muziek stoppen is een Home Assistant-opdracht. "
+)
+VOICE_SLEEP_INSTRUCTIONS = (
+    "Delegeer 'ga slapen', 'ga in slaapstand' of 'zet jezelf in stand-by' meteen als StackChan-opdracht. "
+    "Gebruik stackchan_control met action sleep als de gebruiker de StackChan in slaap wil zetten. "
 )
 LOGGER = logging.getLogger("stackchan")
 DEVICE_STOP_REASONS = frozenset({
@@ -72,6 +68,8 @@ DEVICE_STAT_INTEGERS = frozenset({
     "render_max_ms", "send_max_ms", "free_heap", "psram_bytes", "volume",
     "send_stalls", "recv_service_max_ms", "panel_button_mask", "tx_wait_events",
     "tx_wait_max_ms", "failed_send_ms", "voiced_gap_ms",
+    "light_sleep_ms", "light_sleep_count", "standby_faults",
+    "head_faults", "head_standby_at", "head_wake_at",
 })
 UPSTREAM_ERROR_CODES = frozenset({
     "invalid_api_key", "invalid_request_error", "invalid_value", "invalid_event",
@@ -175,7 +173,7 @@ class Config:
                 names.add(definition["name"])
             object.__setattr__(self, "_functions", tuple(definitions))
 
-    def start_event(self, *, voice_controls: bool = False) -> dict[str, Any]:
+    def start_event(self, *, voice_controls: bool = False, voice_sleep: bool = False) -> dict[str, Any]:
         tools = ([{"type": "web_search"}] if self.web_search else []) + list(self._functions)
         controls = VOICE_CONTROL_INSTRUCTIONS if voice_controls else ""
         live_controls = (
@@ -185,7 +183,22 @@ class Config:
             "Wacht op de tool. Een mondelinge bevestiging alleen voert de opdracht niet uit. "
         ) if voice_controls else ""
         if voice_controls:
-            tools.append(VOICE_CONTROL_TOOL)
+            actions = ["stop", "volume", "mute"]
+            description = ("Control this StackChan robot when the user explicitly asks to end its conversation, "
+                           "change its speaker volume, or mute its microphone.")
+            if voice_sleep:
+                actions.append("sleep")
+                description += " Use sleep to end the conversation and put StackChan to sleep immediately."
+                controls += VOICE_SLEEP_INSTRUCTIONS
+                live_controls += VOICE_SLEEP_INSTRUCTIONS
+            tools.append({
+                "type": "function", "name": VOICE_CONTROL_NAME, "strict": False,
+                "description": description,
+                "parameters": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": actions},
+                    "percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                }, "required": ["action"], "additionalProperties": False},
+            })
         cached_targets = getattr(self.tool_handler, "cached_targets", lambda: [])()
         saved_aliases = getattr(self.tool_handler, "saved_aliases", lambda: [])()
         target_context = ("\nEerder bevestigde Home Assistant-doelen (JSON-gegevens): " +
@@ -321,7 +334,7 @@ class LiveSession:
     """One paid session. A terminal condition never reconnects automatically."""
 
     def __init__(self, device: DeviceConnection, config: Config, upstream_url: str, *, paired_pcm: bool = False,
-                 voice_controls: bool = False) -> None:
+                 voice_controls: bool = False, voice_sleep: bool = False) -> None:
         self.device = device
         self.paired_pcm = paired_pcm
         self.config = config
@@ -349,10 +362,11 @@ class LiveSession:
         self.seen_web_call_ids: set[str] = set()
         self.allowed_functions = {definition["name"] for definition in config._functions}
         self.voice_controls = voice_controls
+        self.voice_sleep = voice_sleep
         self.control_request_id = 0
         self.control_ack: asyncio.Future[bool] | None = None
         if voice_controls:
-            self.allowed_functions.add(VOICE_CONTROL_TOOL["name"])
+            self.allowed_functions.add(VOICE_CONTROL_NAME)
         self.backend_event_ids: set[str] = set()
         self.backend_sequence = 0
         self.tool_results_waiting = False
@@ -570,7 +584,7 @@ class LiveSession:
             try:
                 self.metrics["tool_calls_executed"] += 1
                 async with asyncio.timeout(self.config.tool_timeout):
-                    if name == VOICE_CONTROL_TOOL["name"]:
+                    if name == VOICE_CONTROL_NAME:
                         result = await self._voice_control(arguments)
                     else:
                         result = await self.config.tool_handler.execute(name, arguments)
@@ -619,7 +633,9 @@ class LiveSession:
         if action == "volume":
             valid = set(arguments) == {"action", "percent"} and type(percent) is int and 0 <= percent <= 100
         else:
-            valid = action in ("stop", "mute") and set(arguments) == {"action"}
+            valid = set(arguments) == {"action"} and (
+                action in ("stop", "mute") or (action == "sleep" and self.voice_sleep)
+            )
         if not valid:
             return {"ok": False, "error": "invalid_device_control"}
         if not self.ready or self.stop_event.is_set():
@@ -639,9 +655,12 @@ class LiveSession:
             self.control_ack = None
         log_diagnostic("voice_control", session=self.local_session, action=action, accepted=accepted,
                        **({"percent": percent} if action == "volume" else {}))
-        return {"ok": True, **({"percent": percent} if action == "volume" else {"muted": True})} if accepted else {
-            "ok": False, "error": "device_control_rejected",
-        }
+        if not accepted:
+            return {"ok": False, "error": "device_control_rejected"}
+        if action == "sleep":
+            self.stop("user_stop")
+            return {"ok": True}
+        return {"ok": True, **({"percent": percent} if action == "volume" else {"muted": True})}
 
     def acknowledge_voice_control(self, request_id: int, accepted: bool) -> None:
         if request_id == self.control_request_id and self.control_ack is not None and not self.control_ack.done():
@@ -992,7 +1011,9 @@ class LiveSession:
             ) as upstream:
                 if self.stop_event.is_set():
                     return
-                await upstream.send(json.dumps(self.config.start_event(voice_controls=self.voice_controls)))
+                await upstream.send(json.dumps(self.config.start_event(
+                    voice_controls=self.voice_controls, voice_sleep=self.voice_sleep,
+                )))
                 reader = asyncio.create_task(self._reader(upstream))
                 stop_wait = asyncio.create_task(self.stop_event.wait())
                 ready_wait = asyncio.create_task(self.ready_event.wait())
@@ -1103,7 +1124,8 @@ class LiveBridge:
         last_diagnostics = -math.inf
         paired_pcm = socket.request.headers.get_all("X-StackChan-Audio") == ["pcm-pair-v1"]
         voice_controls = socket.request.headers.get_all("X-StackChan-Controls") == ["voice-v1"]
-        log_diagnostic("device_connected", connection=connection_id, voice_controls=voice_controls)
+        voice_sleep = voice_controls and socket.request.headers.get_all("X-StackChan-Sleep") == ["1"]
+        log_diagnostic("device_connected", connection=connection_id, voice_controls=voice_controls, voice_sleep=voice_sleep)
         device = DeviceConnection(socket, self.config, paired_pcm=paired_pcm)
         session: LiveSession | None = None
         task: asyncio.Task[Any] | None = None
@@ -1142,7 +1164,7 @@ class LiveBridge:
                         await device.error("already_started")
                     else:
                         session = LiveSession(device, self.config, self.upstream_url, paired_pcm=paired_pcm,
-                                              voice_controls=voice_controls)
+                                              voice_controls=voice_controls, voice_sleep=voice_sleep)
                         task = asyncio.create_task(session.run())
                 elif kind == "stop" and (set(command) == {"type"} or (
                     set(command) == {"type", "reason"} and isinstance(command["reason"], str)
@@ -1256,7 +1278,7 @@ async def run_server(args: argparse.Namespace) -> None:
         open_timeout=5, close_timeout=1, ping_interval=20, ping_timeout=10,
         server_header=None,
     ):
-        LOGGER.info("StackChan bridge gereed; TLS actief, maximaal één apparaat. Een gesprek start pas na een druk op Start.")
+        LOGGER.info("StackChan bridge gereed; TLS actief, maximaal één apparaat. De StackChan vraagt nieuwe gesprekken aan.")
         await stop.wait()
 
 

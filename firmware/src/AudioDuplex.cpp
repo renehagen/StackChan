@@ -75,9 +75,10 @@ bool AudioDuplex::begin() {
   // M5Unified 0.2.12 has no pinmap for that new board ID. Its display/touch
   // already use the CoreS3 hardware; establish that same internal codec bus.
   // This application does not use the missing M5Unified PMIC/IMU/RTC mapping.
-  if (board == m5::board_t::board_M5StackChan &&
+  if (!busInitialized_ && board == m5::board_t::board_M5StackChan &&
       !M5.In_I2C.begin(I2C_NUM_1, 12, 11)) return false;
   if (!M5.In_I2C.isEnabled()) return false;
+  busInitialized_ = true;
 
   // Do not uninstall an existing driver's port: accidental M5.Mic/Speaker
   // ownership should fail initialization, rather than corrupt another task.
@@ -188,14 +189,23 @@ void AudioDuplex::silence() {
   if (installed_) i2s_zero_dma_buffer(kPort);
 }
 
-void AudioDuplex::end() {
+bool AudioDuplex::end() {
   // Owner must stop/join workers first. M5 I2C remains owned by M5Unified.
   ready_ = false;
-  if (!installed_) return;
+  if (!installed_) return true;
   i2s_zero_dma_buffer(kPort);
   ampWrite(0x04, 0x4000);
-  M5.In_I2C.bitOff(kIoAddress, 0x02, 0x04, kI2cFrequency);
-  M5.In_I2C.writeRegister8(kMicAddress, 0x00, 0xFF, kI2cFrequency);
-  i2s_driver_uninstall(kPort);
-  installed_ = false;
+  auto& bus = M5.In_I2C;
+  const bool ampOff = bus.bitOff(kIoAddress, 0x02, 0x04, kI2cFrequency);
+  // ES7210 standby disables mic bias, ADC, analog stages and clocks.
+  // https://github.com/espressif/esp-audio-dev/blob/main/esp_codec_dev/device/es7210/es7210.c
+  bool micOff = true;
+  for (uint8_t reg = 0x47; reg <= 0x4C; ++reg) {
+    if (!bus.writeRegister8(kMicAddress, reg, 0xFF, kI2cFrequency)) micOff = false;
+  }
+  if (!bus.writeRegister8(kMicAddress, 0x40, 0xC0, kI2cFrequency)) micOff = false;
+  if (!bus.writeRegister8(kMicAddress, 0x01, 0x7F, kI2cFrequency)) micOff = false;
+  if (!bus.writeRegister8(kMicAddress, 0x06, 0x07, kI2cFrequency)) micOff = false;
+  installed_ = i2s_driver_uninstall(kPort) != ESP_OK;
+  return !installed_ && ampOff && micOff;
 }

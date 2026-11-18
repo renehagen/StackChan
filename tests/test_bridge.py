@@ -274,8 +274,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.event(socket, "connected")
         await self.start(socket)
         startup = await self.fake.next("session.start")
-        self.assertIn("stackchan_control", [tool.get("name") for tool in
-                      startup["session"]["delegation"]["responses"]["tools"]])
+        controls = next(tool for tool in startup["session"]["delegation"]["responses"]["tools"]
+                        if tool.get("name") == "stackchan_control")
+        self.assertNotIn("sleep", controls["parameters"]["properties"]["action"]["enum"])
 
         async def call(action, **arguments):
             await self.fake.begin_response("response_" + action, "delegation_" + action)
@@ -315,6 +316,42 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await socket.send(bytes(FRAME_BYTES))
         await socket.send('{"type":"regression_barrier"}')
         self.assertEqual(await self.event(socket), {"type": "error", "code": "invalid_command"})
+        await socket.close()
+
+    async def test_voice_sleep_closes_only_after_device_acknowledgement(self):
+        socket = await connect(self.url, additional_headers={
+            "Authorization": f"Bearer {TOKEN}", "X-StackChan-Controls": "voice-v1", "X-StackChan-Sleep": "1",
+        }, proxy=None)
+        await self.event(socket, "connected")
+        await self.start(socket)
+        startup = await self.fake.next("session.start")
+        controls = next(tool for tool in startup["session"]["delegation"]["responses"]["tools"]
+                        if tool.get("name") == "stackchan_control")
+        self.assertIn("sleep", controls["parameters"]["properties"]["action"]["enum"])
+        self.assertIn("ga slapen", startup["session"]["instructions"])
+
+        async def request_sleep(label):
+            response = "response_" + label
+            delegation = "delegation_" + label
+            await self.fake.begin_response(response, delegation)
+            await self.fake.function_call("call_" + label, "stackchan_control", '{"action":"sleep"}', delegation)
+            await self.fake.complete_response(response, delegation)
+            command = await self.event(socket, "voice_control")
+            self.assertEqual(command["action"], "sleep")
+            return command["id"]
+
+        request_id = await request_sleep("rejected")
+        await socket.send(json.dumps({"type": "voice_control_ack", "id": request_id, "ok": False}))
+        result = await self.fake.next("response.item.create")
+        self.assertEqual(json.loads(result["item"]["output"]), {"ok": False, "error": "device_control_rejected"})
+        await self.fake.next("response.create")
+
+        request_id = await request_sleep("accepted")
+        await socket.send(json.dumps({"type": "voice_control_ack", "id": request_id, "ok": True}))
+        await self.fake.next("session.close")
+        closed = await self.event(socket, "closed")
+        self.assertEqual(closed["reason"], "user_stop")
+        self.assertTrue(closed["usage_confirmed"])
         await socket.close()
 
     async def test_upstream_error_is_redacted_and_finalized(self):

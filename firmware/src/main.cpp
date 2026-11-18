@@ -12,6 +12,9 @@
 #include "HeadMotion.h"
 #include "VoiceTest.h"
 #include <esp_heap_caps.h>
+#include <esp_sleep.h>
+#include <esp_timer.h>
+#include <freertos/event_groups.h>
 #include <lwip/sockets.h>
 
 namespace {
@@ -41,6 +44,9 @@ std::atomic<uint32_t> displaySpeechUntil{0};
 DeviceUi ui(displaySpeechUntil);
 constexpr uint32_t kDisplaySpeechTailMs = 900;
 QueueHandle_t captureQueue, playbackQueue;
+EventGroupHandle_t audioGate;
+constexpr EventBits_t kAudioRun = BIT0, kCaptureParked = BIT1, kPlaybackParked = BIT2;
+constexpr EventBits_t kAudioParked = kCaptureParked | kPlaybackParked;
 constexpr unsigned kCaptureFrames = 240, kPlaybackFrames = 200;
 StaticQueue_t captureControl{}, playbackControl{};
 bool pairedPcm = false;
@@ -65,13 +71,49 @@ uint32_t volumeChangedAt = 0;
 bool volumeDirty = false;
 String lastStop = "none", lastBridgeError;
 bool configured = false, audioReady = false, socketStarted = false;
+bool audioWorkersReady = false, standbyPower = false, standbyAudioOff = false;
+bool wakeStartPending = false;
+uint32_t wakeRequestedAt = 0, lightSleepMs = 0, lightSleepCount = 0, standbyFaults = 0;
 bool connected = false, starting = false, closing = false, mutePending = false;
 bool requestedMuteState = false;
 bool protocolFault = false;
 uint32_t operationSince = 0, muteSince = 0, wifiSince = 0, clockSince = 0;
 String authHeader, serialLine, status = "Instellen via USB";
 constexpr uint32_t kBackground = 0x0D1825;
+constexpr uint8_t kDefaultBrightness = 77;  // 30% of the 0..255 range, rounded.
 constexpr uint32_t kOperationTimeout = 20000;
+
+bool externalPowerPresent() {
+  if (Serial.isPlugged()) return true;
+  // A USB charger supplies VBUS without enumerating as a USB data host.
+  static uint32_t sampledAt = 0;
+  static bool vbusGood = true;
+  const uint32_t now = millis();
+  if (!sampledAt || now - sampledAt >= 150) {
+    uint8_t pmicStatus = 0;
+    if (M5.In_I2C.readRegister(0x34, 0x00, &pmicStatus, 1, 400000))
+      vbusGood = (pmicStatus & 0x20) != 0;
+    sampledAt = now;
+  }
+  return vbusGood;
+}
+
+int8_t batteryPercent() {
+  if (externalPowerPresent()) return -1;
+  static uint32_t sampledAt = 0;
+  static int8_t percent = -1;
+  const uint32_t now = millis();
+  if (!sampledAt || now - sampledAt >= 15000) {
+    // AXP2101 fuel-gauge percentage, calibrated by the battery controller.
+    uint8_t level = 0;
+    if (M5.In_I2C.readRegister(0x34, 0xA4, &level, 1, 400000) && level <= 100)
+      percent = level;
+    else
+      percent = -1;
+    sampledAt = now;
+  }
+  return percent;
+}
 
 void updateHigh(std::atomic<uint32_t>& value, uint32_t sample) {
   uint32_t previous = value.load();
@@ -107,12 +149,20 @@ bool parseConfig(const String& source, Config& result) {
   return true;
 }
 
-// Only the audio tasks own the I2S API. The network/UI task uses bounded queues.
+bool waitForAudio(EventBits_t parked) {
+  if (xEventGroupGetBits(audioGate) & kAudioRun) return false;
+  xEventGroupSetBits(audioGate, parked);
+  xEventGroupWaitBits(audioGate, kAudioRun, pdFALSE, pdTRUE, portMAX_DELAY);
+  return true;
+}
+
+// Workers use I2S only while kAudioRun is set. Shutdown waits for both workers.
 void captureTask(void*) {
   uint32_t lastSample = millis();
   for (;;) {
+    if (waitForAudio(kCaptureParked)) lastSample = millis();
     AudioFrame frame;
-    while (frame.count < kAudioSamples) {
+    while (frame.count < kAudioSamples && (xEventGroupGetBits(audioGate) & kAudioRun)) {
       const size_t n = audio.read(frame.samples + frame.count,
                                  kAudioSamples - frame.count, 50);
       if (n == 0) {
@@ -125,7 +175,7 @@ void captureTask(void*) {
       rxSamples.fetch_add(n);
       frame.count += n;
     }
-    if (!active.load()) continue;
+    if (frame.count != kAudioSamples || !active.load()) continue;
     frame.capturedMs = millis();
     const bool echoGuard = static_cast<int32_t>(echoUntil.load() - millis()) > 0;
     if (voiceTest::enabled()) voiceTest::measureMic(frame, echoGuard);
@@ -154,6 +204,7 @@ void playbackTask(void*) {
   uint32_t lastVoiced = 0, gapSince = 0;
   unsigned resumedFrames = 0;
   for (;;) {
+    waitForAudio(kPlaybackParked);
     const uint32_t queued = uxQueueMessagesWaiting(playbackQueue);
     updateHigh(playbackQueueHigh, queued);
     if (!active.load() || localOutputHold.load()) {
@@ -281,12 +332,13 @@ void handleVoiceControl(const JsonDocument& doc) {
   const String action = doc["action"] | "";
   bool accepted = false;
   if (active.load() && !closing) {
-    if (action == "stop") {
+    if (action == "stop" || action == "sleep") {
       localInputHold = localOutputHold = true;
+      if (action == "sleep") ui.requestSleep();
       stopConversation("Gesprek stoppen...", "user_stop", false);
-      return;  // The bridge is already finalizing this session.
-    }
-    if (action == "volume" && doc["percent"].is<int>()) {
+      if (action == "stop") return;  // The bridge is already finalizing this session.
+      accepted = true;
+    } else if (action == "volume" && doc["percent"].is<int>()) {
       const int percent = doc["percent"].as<int>();
       if (percent >= 0 && percent <= 100) {
         setDeviceVolume(percent);
@@ -419,11 +471,12 @@ void immediateUiCommand(UiCommand command, const UiSnapshot& snapshot) {
 }
 
 bool startConversation() {
-  if (active.load() || starting || closing || !audioReady || !connected || protocolFault) return false;
+  if (ui.sleeping() || active.load() || starting || closing || !audioReady || !connected || protocolFault) return false;
   clearAudio();
   lastStop = "none";
   lastBridgeError = "";
   starting = true;
+  wakeStartPending = false;
   operationSince = millis();
   status = "Verbinding met OpenAI...";
   sendControl("start");
@@ -443,6 +496,10 @@ void handleUiCommands() {
       }
     } else if (command == UiCommand::StartSession) {
       startConversation();
+    } else if (command == UiCommand::WakeSession) {
+      // A touch may arrive before the audio driver has been restored.
+      wakeStartPending = configured && audioWorkersReady;
+      wakeRequestedAt = millis();
     } else if (command == UiCommand::Mute || command == UiCommand::Unmute) {
       requestMute(command == UiCommand::Mute);
     }
@@ -456,9 +513,9 @@ void handleUiCommands() {
   }
 }
 
-void publishUi() {
+void publishUi(bool force = false) {
   static uint32_t last = 0;
-  if (millis() - last < 40) return;
+  if (!force && millis() - last < 40) return;
   last = millis();
   UiSnapshot snapshot{};
   snapshot.active = active.load();
@@ -468,6 +525,7 @@ void publishUi() {
   snapshot.closing = closing;
   snapshot.connected = connected;
   snapshot.wifiConnected = WiFi.status() == WL_CONNECTED;
+  snapshot.batteryPercent = batteryPercent();
   snapshot.volume = volume.load();
   status.toCharArray(snapshot.status, sizeof(snapshot.status));
   ui.publish(snapshot);
@@ -502,6 +560,10 @@ void addStats(JsonObject stats) {
   stats["free_heap"] = ESP.getFreeHeap();
   stats["psram_bytes"] = ESP.getPsramSize();
   stats["volume"] = volume.load();
+  stats["light_sleep_ms"] = lightSleepMs;
+  stats["light_sleep_count"] = lightSleepCount;
+  stats["standby_faults"] = standbyFaults;
+  head::standbyStats(stats);
   // Bridge accepts only its fixed reason enum. Arbitrary remote codes stay USB-local.
   const char* known[] = {"none","stopped","user_stop","capture_overflow","playback_overflow","audio_io","wifi_lost","protocol_error","bridge_error","operation_timeout","mute_timeout","audio_send_failed"};
   for (const char* code : known) if (lastStop == code) { stats["last_stop"] = code; break; }
@@ -560,7 +622,7 @@ void handleSerial() {
         }
         Serial.println(ok ? "TEST OK" : "TEST ERROR");
       } else if (serialLine == "MOTION_TEST") {
-        const bool accepted = !active.load() && !starting && !closing && head::requestTest();
+        const bool accepted = !active.load() && !starting && !closing && !ui.sleeping() && head::requestTest();
         Serial.println(accepted ? "MOTION_TEST queued" : "MOTION_TEST busy_or_unavailable");
       } else if (serialLine == "DIAG") {
         JsonDocument diag;
@@ -585,6 +647,13 @@ void handleSerial() {
         diag["mute_pending"] = mutePending;
         diag["free_heap"] = ESP.getFreeHeap();
         diag["ui_ready"] = ui.ready();
+        diag["standby"] = ui.sleeping();
+        diag["standby_audio_off"] = standbyAudioOff;
+        diag["standby_wifi_off"] = WiFi.getMode() == WIFI_OFF;
+        diag["external_power"] = externalPowerPresent();
+        diag["battery_percent"] = batteryPercent();
+        diag["top_touch_ready"] = ui.topTouchReady();
+        diag["top_wakes"] = ui.topWakes();
         diag["listening_wave_frames"] = ui.listeningWaveFrames();
         diag["listening_wave_height_px"] = ui.listeningWaveHeight();
         diag["speaking_wave_frames"] = ui.speakingWaveFrames();
@@ -699,7 +768,8 @@ void maintainNetwork() {
   }
   if (!socketStarted) {
     authHeader = "Authorization: Bearer " + cfg.token +
-        "\r\nX-StackChan-Audio: pcm-pair-v1\r\nX-StackChan-Controls: voice-v1";
+        "\r\nX-StackChan-Audio: pcm-pair-v1\r\nX-StackChan-Controls: voice-v1"
+        "\r\nX-StackChan-Sleep: 1";
     audioSocket.beginSslWithCA(cfg.host.c_str(), cfg.port, "/device", cfg.ca.c_str(), "");
     audioSocket.setExtraHeaders(authHeader.c_str());
     audioSocket.onEvent(onSocket);
@@ -718,6 +788,56 @@ void maintainNetwork() {
   for (int i = 0; i < 24 && audioSocket.hasPendingInput() && millis() - drainStarted < 8; ++i)
     audioSocket.loop();
   recvServiceMaxMs = std::max<uint32_t>(recvServiceMaxMs, millis() - serviceStarted);
+}
+
+void connectWifi() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(cfg.ssid.c_str(), cfg.password.c_str());
+  wifiSince = millis();
+  status = "Wifi verbinden...";
+}
+
+void serviceStandby() {
+  if (!standbyPower) {
+    standbyPower = true;
+    if (socketStarted) audioSocket.disconnect();
+    socketStarted = connected = pairedPcm = false;
+    if (WiFi.getMode() != WIFI_OFF && !WiFi.mode(WIFI_OFF)) ++standbyFaults;
+    if (audioReady) xEventGroupClearBits(audioGate, kAudioRun | kAudioParked);
+    // The normal publishing loop stops here. Release a touch that arrived
+    // during the close even if its final snapshot was throttled.
+    publishUi(true);
+  }
+  if (audioReady && (xEventGroupGetBits(audioGate) & kAudioParked) == kAudioParked) {
+    standbyAudioOff = audio.end();
+    audioReady = false;
+    if (!standbyAudioOff) ++standbyFaults;
+  }
+  // The top sensor's interrupt is unconnected. Keep RAM and poll the touch
+  // controls between timed sleeps. A USB data host needs an awake controller.
+  if (!audioReady && head::standbySettled() && WiFi.getMode() == WIFI_OFF && !Serial.isPlugged()) {
+    if (esp_sleep_enable_timer_wakeup(40000) == ESP_OK) {
+      const int64_t started = esp_timer_get_time();
+      const auto result = esp_light_sleep_start();
+      if (result == ESP_OK) {
+        ++lightSleepCount;
+        lightSleepMs += static_cast<uint32_t>((esp_timer_get_time() - started) / 1000);
+      }
+    }
+  }
+  delay(10);
+}
+
+void resumeFromStandby() {
+  standbyPower = standbyAudioOff = false;
+  if (audioWorkersReady) {
+    if (!audioReady) audioReady = audio.begin();
+    if (audioReady) xEventGroupSetBits(audioGate, kAudioRun);
+  }
+  if (!audioReady) status = "Audiofout - controleer apparaat";
+  else if (configured) connectWifi();
 }
 } // namespace
 
@@ -743,30 +863,31 @@ void setup() {
   };
   captureQueue = makeQueue(kCaptureFrames, captureControl);
   playbackQueue = makeQueue(kPlaybackFrames, playbackControl);
-  audioReady = captureQueue && playbackQueue && audio.begin();
+  audioGate = xEventGroupCreate();
+  audioReady = captureQueue && playbackQueue && audioGate && audio.begin();
   if (audioReady) {
     const bool rx = xTaskCreatePinnedToCore(captureTask, "capture", 4096, nullptr, 5, nullptr, 0) == pdPASS;
     const bool tx = xTaskCreatePinnedToCore(playbackTask, "playback", 4096, nullptr, 5, nullptr, 0) == pdPASS;
-    audioReady = rx && tx;
+    audioReady = audioWorkersReady = rx && tx;
+    if (audioReady) xEventGroupSetBits(audioGate, kAudioRun);
+    else audio.end();
+  }
+  if (M5.getBoard() == m5::board_t::board_M5StackChan) {
+    // This firmware never uses the camera or SD card. ALDO3 and ALDO4 feed
+    // those peripherals only on the official StackChan's CoreS3 board.
+    if (!M5.In_I2C.bitOff(0x34, 0x90, 0x0C, 400000)) ++standbyFaults;
   }
   // Apply backlight after the official StackChan's internal I2C bus has been
   // restored by AudioDuplex. A cached brightness alone doesn't prove it is on.
   M5.Display.wakeup();
-  M5.Display.setBrightness(160);
+  M5.Display.setBrightness(kDefaultBrightness);
   preferences.begin("stackchan", true);
   configured = parseConfig(preferences.getString("config", ""), cfg);
   volume = std::min<uint8_t>(100, preferences.getUChar("volume", 90));
   preferences.end();
   audio.setVolume(volume.load());
   if (!audioReady) status = "Audiofout - controleer apparaat";
-  else if (configured) {
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.begin(cfg.ssid.c_str(), cfg.password.c_str());
-    wifiSince = millis();
-    status = "Wifi verbinden...";
-  }
+  else if (configured) connectWifi();
   ui.setImmediateHandler(immediateUiCommand);
   if (!ui.begin()) {
     status = "Schermbuffer niet beschikbaar";
@@ -776,22 +897,33 @@ void setup() {
   // Network owns session state. UI runs separately at priority 1; audio at 5.
   vTaskPrioritySet(nullptr, 3);
   head::begin([] {
+    if (ui.sleeping()) return head::State::Sleeping;
     if (!active.load() || localOutputHold.load()) return head::State::Idle;
     if (!volume.load() || locallyMuted.load() || localInputHold.load()) return head::State::Listening;
     return static_cast<int32_t>(echoUntil.load() - millis()) > 0 ?
         head::State::Speaking : head::State::Listening;
   });
-  Serial.println("STACKCHAN_READY v15");
+  Serial.println("STACKCHAN_READY v22");
 }
 
 void loop() {
   const uint32_t began = millis();
   handleSerial();
+  if (ui.sleeping() && !active.load() && !starting && !closing && !externalPowerPresent()) {
+    handleUiCommands();
+    serviceStandby();
+    return;
+  }
+  if (standbyPower) resumeFromStandby();
   if (voiceTest::expired()) stopConversation("Spraaktest afgerond");
   // Only an explicit USB hardware test can inject this single bounded stall.
   const bool paused = voiceTest::enabled() && testStallUsed && static_cast<int32_t>(testResumeAt-millis()) > 0;
   if (!paused) maintainNetwork();
   handleUiCommands();
+  if (wakeStartPending) {
+    if (millis() - wakeRequestedAt >= kOperationTimeout) wakeStartPending = false;
+    else startConversation();
+  }
   const uint32_t faults = audioFaults.exchange(0);
   if (faults && (active.load() || starting)) {
     stopConversation("Audio onderbroken - start opnieuw", "audio_io");

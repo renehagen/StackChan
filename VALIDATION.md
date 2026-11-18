@@ -1,5 +1,25 @@
 # Validatie
 
+## Firmware v22 en wekken op batterij — 18 november 2026
+
+De USB-upload is geverifieerd. Bij overgang naar de zuinige stand krijgt de schermtaak de definitieve gespreksstatus, ook als de normale schermupdate vlak daarvoor is overgeslagen. Een vroege wekopdracht blijft beschikbaar totdat audio en de bridge gereed zijn. Op de fysieke StackChan registreerde de bridge meerdere nieuwe gesprekken na processorslaap op batterij, ook nadat ‘Ga slapen’ op batterij was uitgesproken. De servometingen bevestigden dat het hoofd omhoogkwam. De firmware meldde geen slaap- of servofouten.
+
+## Firmware v21 en direct inslapen — 18 november 2026
+
+De USB-upload is geverifieerd. Na de gesproken opdracht ‘Ga slapen’ las de test de uitgeschakelde achtergrondverlichting en de bewegende kantelservo uit terwijl de sessie nog aan het afsluiten was. De kantelservo ging van positie 754 naar 712. De sessie was ongeveer 1,8 seconde na de eerste uitlezing met uitgeschakelde verlichting afgesloten. OpenAI bevestigde de afsluiting. Met USB-voeding was het batterijpercentage verborgen. De gebruiker bevestigde dat het percentage op batterij zichtbaar was.
+
+## Firmware v20 en slaapstand per voedingsbron — 18 november 2026
+
+Na de geverifieerde USB-upload is de fysieke StackChan twee keer gewekt via het aanraakvlak bovenop. Op USB-voeding bleven de bridgeverbinding en audio actief tijdens het slapen. Het nieuwe gesprek was 1,1 seconde na de startaanvraag gereed. Na het loshalen van USB registreerde de firmware 151 korte processorslaapcycli, samen 6.039 ms. Bij aanraking verbond de StackChan opnieuw en startte een gesprek. De kantelservo ging in beide proeven omhoog en de firmware meldde geen slaap- of servofouten. De USB-netadapter zonder dataverbinding is niet apart fysiek getest.
+
+## Firmware v18 en zuinige slaapstand — 18 november 2026
+
+De USB-upload is geverifieerd en alle 90 regressietests slaagden. Na de akoestische opdracht ‘Ga slapen’ bevestigde de fysieke StackChan via USB dat wifi, schermverlichting, audio en servovoeding waren uitgeschakeld. De audio-sampletellers bleven gelijk en de PMIC meldde dat de camera- en SD-voedingen uit stonden. Na aanraking verbond de StackChan opnieuw met de bridge en startte een nieuw gesprek. De batterijduur en het verbruik in milliampère zijn niet gemeten.
+
+## Firmware v17 en slaapstand — 18 november 2026
+
+De USB-upload is geverifieerd en alle 90 regressietests slaagden. De microfoon van de fysieke StackChan nam de synthetische opdracht ‘StackChan, ga slapen’ op. GPT Live riep de slaapactie aan, de firmware bevestigde de opdracht en de bridge bevestigde de sessieafsluiting. Ongeveer negen seconden na het afspelen van de opdracht was de schermverlichting uit en stond het hoofd op de ingestelde ondergrens. De gemeten kanteling was 10,3°. Bij aanraking van het vlak bovenop herstelde de firmware de kopstand en helderheid (77 van 255). De gebruiker bevestigde dat de luistergolf automatisch verscheen. De USB-diagnostiek registreerde de aanraking en een actief gesprek.
+
 ## Firmware v15 en gesproken bediening — 18 november 2026
 
 De USB-upload is geverifieerd. De fysieke StackChan verwerkte de drie akoestische opdrachten. De firmware stelde 65% in, de bridge bevestigde microfoondemping en de stopopdracht beëindigde de sessie met de status **Gesprek gestopt**. Een laatste gesproken opdracht herstelde het oorspronkelijke volume van 70%. Alle 89 regressietests slaagden.

@@ -28,10 +28,11 @@ class AudioDuplex {
   // 0=silent, 50=original -18 dB, 100=-6 dB. No digital boost/clipping.
   void setVolume(uint8_t percent);
   void silence();
-  void end();
+  bool end();
   bool ready() const { return ready_; }
 
  private:
+  bool busInitialized_ = false;
   bool installed_ = false;
   bool ready_ = false;
   std::atomic<int32_t> gainQ15_{4096};

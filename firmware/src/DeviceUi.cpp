@@ -22,6 +22,9 @@ constexpr int kWidth = 320, kHeight = 240;
 constexpr uint32_t kIdleFrameMs = 100, kWaveFrameMs = 40, kWaveSampleMs = 80;
 constexpr uint32_t kTouchDebounceMs = 180;
 constexpr uint32_t kControlsTimeoutMs = 10000;
+constexpr uint32_t kStandbyTimeoutMs = 60000, kTopTouchPollMs = 20;
+constexpr uint8_t kTopTouchAddress = 0x68, kTopTouchOutput = 0x10;
+constexpr uint32_t kTopTouchI2cHz = 100000;
 constexpr int kSpeechPattern[] = {1, 2, 1, 3, 1};
 constexpr int kBarPitch = 10;
 
@@ -50,6 +53,10 @@ bool showStop(const UiSnapshot& s) { return s.active || s.starting || s.closing;
 bool canSession(const UiSnapshot& s) { return !s.closing && (s.active || s.starting || s.connected); }
 bool canMute(const UiSnapshot& s) { return s.active && !s.closing && !s.mutePending; }
 
+void valueText(char (&text)[8], uint8_t percent) {
+  std::snprintf(text, sizeof(text), "%u%%", static_cast<unsigned>(percent));
+}
+
 void statusLine(Canvas& c, const UiSnapshot& s) {
   c.fillRect(0, 0, kWidth, kHeader.h, kBackground);
   if (s.active && (s.muted || s.mutePending)) {
@@ -59,8 +66,24 @@ void statusLine(Canvas& c, const UiSnapshot& s) {
     c.setTextColor(kWhite, kBackground);
     c.setTextDatum(middle_left);
     const char* label = s.mutePending ? "Microfoon omschakelen..." : "Microfoon gedempt";
-    if (c.textWidth(label) > 263) c.setFont(&fonts::FreeSansBold9pt7b);
+    const int maxWidth = s.batteryPercent >= 0 ? 186 : 263;
+    if (c.textWidth(label) > maxWidth) c.setFont(&fonts::FreeSansBold9pt7b);
+    if (c.textWidth(label) > maxWidth) c.setFont(&fonts::Font2);
     c.drawString(label, 26, 17);
+  }
+  if (s.batteryPercent >= 0) {
+    const uint32_t ink = s.batteryPercent <= 15 ? kPeach : kMuted;
+    c.drawRoundRect(222, 11, 17, 12, 2, ink);
+    c.fillRect(239, 15, 2, 4, ink);
+    const int chargeWidth = (13 * s.batteryPercent + 50) / 100;
+    if (chargeWidth) c.fillRect(224, 13, chargeWidth, 8, ink);
+    char percent[8];
+    valueText(percent, s.batteryPercent);
+    c.setTextSize(1);
+    c.setFont(&fonts::FreeSansBold9pt7b);
+    c.setTextColor(ink, kBackground);
+    c.setTextDatum(middle_right);
+    c.drawString(percent, 285, 17);
   }
   const uint32_t color = s.wifiConnected ? kMuted : kButton;
   c.drawWideLine(294, 12, 298, 9, 1, color);
@@ -125,10 +148,6 @@ void button(Canvas& c, Rect r, Icon shape, const char* label, uint32_t bg, uint3
   c.setTextColor(fg, bg);
   c.setTextDatum(middle_left);
   c.drawString(label, left+25, mid);
-}
-
-void valueText(char (&text)[8], uint8_t volume) {
-  std::snprintf(text, sizeof(text), "%u%%", static_cast<unsigned>(volume));
 }
 
 void toolbar(Canvas& c, const UiSnapshot& s, bool volumeOpen) {
@@ -228,6 +247,19 @@ void microphoneBadge(Canvas& c, int y, bool muted) {
   c.fillSmoothCircle(x, y, 24, fill);
   icon(c, muted ? Icon::Muted : Icon::Mic, x, y, kWhite, fill);
 }
+
+bool setupTopTouch() {
+  if (M5.getBoard() != m5::board_t::board_M5StackChan) return false;
+  // The StackChan BSP's Si12T defaults for the three zones.
+  for (uint8_t reg = 0x0a; reg <= 0x0f; ++reg)
+    if (!M5.In_I2C.writeRegister8(kTopTouchAddress, reg, 0, kTopTouchI2cHz)) return false;
+  if (!M5.In_I2C.writeRegister8(kTopTouchAddress, 0x09, 0x0f, kTopTouchI2cHz) ||
+      !M5.In_I2C.writeRegister8(kTopTouchAddress, 0x09, 0x03, kTopTouchI2cHz) ||
+      !M5.In_I2C.writeRegister8(kTopTouchAddress, 0x08, 0x22, kTopTouchI2cHz)) return false;
+  for (uint8_t reg = 0x02; reg <= 0x06; ++reg)
+    if (!M5.In_I2C.writeRegister8(kTopTouchAddress, reg, 0x33, kTopTouchI2cHz)) return false;
+  return true;
+}
 }  // namespace
 
 bool DeviceUi::begin() {
@@ -300,11 +332,57 @@ void DeviceUi::run() {
   UiSnapshot current;
   UiSnapshot incoming;
   uint32_t lastRender = millis() - kIdleFrameMs;
+  uint32_t idleSince = millis(), lastTopPoll = idleSince;
+  unsigned consecutiveTopTouches = 0;
+  uint8_t savedBrightness = 0;
+  bool wakePending = false;
+  topTouchReady_ = setupTopTouch();
   for (;;) {
     if (xQueueReceive(snapshots_, &incoming, 0) == pdTRUE) current = incoming;
     M5.update();
-    if (!firstPaint_) handleTouch(painted_);
     const uint32_t now = millis();
+    const bool busy = current.active || current.starting || current.closing;
+    const bool screenTouch = M5.Touch.getDetail().wasPressed();
+    if (topTouchReady() && (!busy || sleeping()) && now - lastTopPoll >= kTopTouchPollMs) {
+      lastTopPoll = now;
+      uint8_t levels = 0;
+      const bool touched = M5.In_I2C.readRegister(kTopTouchAddress, kTopTouchOutput,
+                                                &levels, 1, kTopTouchI2cHz) && (levels & 0x3f);
+      consecutiveTopTouches = touched ? std::min(2u, consecutiveTopTouches + 1) : 0;
+    } else if (busy && !sleeping()) {
+      consecutiveTopTouches = 0;
+    }
+    const bool topTouch = consecutiveTopTouches == 2;
+    if (busy || screenTouch || topTouch) idleSince = now;
+    if (sleeping()) {
+      if (topTouch && !wakePending) topWakes_.fetch_add(1, std::memory_order_relaxed);
+      wakePending = wakePending || screenTouch || topTouch;
+      if (!busy && wakePending) {
+        M5.Display.wakeup();
+        sleeping_ = false;
+        idleSince = now;
+        const auto command = UiCommand::WakeSession;
+        xQueueSend(commands_, &command, 0);
+        firstPaint_ = true;
+        render(current, now);
+        M5.Display.setBrightness(savedBrightness);
+        lastRender = millis();
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    if (sleepRequested_.exchange(false) || (!busy && now - idleSince >= kStandbyTimeoutMs)) {
+      savedBrightness = M5.Display.getBrightness();
+      M5.Display.setBrightness(0);
+      sleeping_ = true;
+      M5.Display.sleep();
+      wakePending = false;
+      volumeOpen_ = false;
+      controlsVisible_ = false;
+      panelButtonMask_ = 0;
+      continue;
+    }
+    if (!firstPaint_) handleTouch(painted_);
     if (volumeOpen_ && now - volumeTouchedAt_ >= 5000) volumeOpen_ = false;
     if (now - lastRender >= (current.active ? kWaveFrameMs : kIdleFrameMs)) {
       current.speaking = current.active && current.volume &&
@@ -364,6 +442,7 @@ void DeviceUi::render(const UiSnapshot& s, uint32_t now) {
   const bool visibilityChanged = first || visible != controlsVisible();
   const bool statusChanged = std::strcmp(s.status, painted_.status) != 0;
   const bool header = first || s.active != painted_.active || s.wifiConnected != painted_.wifiConnected ||
+      s.batteryPercent != painted_.batteryPercent ||
       (s.active && (s.muted != painted_.muted || s.mutePending != painted_.mutePending));
   const WaveMode mode = !s.active ? WaveMode::Idle : s.speaking ? WaveMode::Speaking :
       (s.muted || s.mutePending) ? WaveMode::Muted : WaveMode::Listening;
