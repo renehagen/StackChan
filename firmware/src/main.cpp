@@ -50,7 +50,11 @@ constexpr EventBits_t kAudioParked = kCaptureParked | kPlaybackParked;
 constexpr unsigned kCaptureFrames = 240, kPlaybackFrames = 200;
 StaticQueue_t captureControl{}, playbackControl{};
 bool pairedPcm = false;
-std::atomic<unsigned> prebufferFrames{20};
+constexpr unsigned kFastPrebufferFrames = 60, kMediumPrebufferFrames = 65, kSafePrebufferFrames = 105;
+constexpr uint32_t kPrebufferSignalSampleMs = 1000, kPrebufferRecoveryMs = 5000;
+std::atomic<unsigned> prebufferFrames{kFastPrebufferFrames};
+std::atomic<uint32_t> playbackVoiceLagMs{0};
+uint32_t prebufferSampledAt = 0, lastTxCongestionAt = 0;
 std::atomic<uint32_t> voicedGapMs{0};
 bool testStallUsed = false;
 uint32_t testResumeAt = 0;
@@ -82,6 +86,16 @@ String authHeader, serialLine, status = "Instellen via USB";
 constexpr uint32_t kBackground = 0x0D1825;
 constexpr uint8_t kDefaultBrightness = 77;  // 30% of the 0..255 range, rounded.
 constexpr uint32_t kOperationTimeout = 20000;
+
+void updatePlaybackPrebuffer(uint32_t now) {
+  prebufferSampledAt = now;
+  const int32_t signal = WiFi.RSSI();
+  // A good RSSI alone is insufficient if TCP recently stopped accepting audio.
+  const bool recovering = lastTxCongestionAt && now - lastTxCongestionAt < kPrebufferRecoveryMs;
+  if (recovering || signal <= -67 || signal >= 0) prebufferFrames = kSafePrebufferFrames;
+  else if (signal <= -60) prebufferFrames = kMediumPrebufferFrames;
+  else prebufferFrames = kFastPrebufferFrames;
+}
 
 bool externalPowerPresent() {
   if (Serial.isPlugged()) return true;
@@ -212,9 +226,10 @@ void playbackTask(void*) {
       firstQueuedAt = lastVoiced = gapSince = resumedFrames = 0;
     }
     if (active.load() && !localOutputHold.load() && !playing && queued) {
-      if (!firstQueuedAt) firstQueuedAt = millis();
+      const uint32_t now = millis();
+      if (!firstQueuedAt) firstQueuedAt = now;
       const unsigned target = prebufferFrames.load();
-      if (queued >= target || millis() - firstQueuedAt >= target*20 + 60) playing = true;
+      if (queued >= target || now - firstQueuedAt >= target * 20 + 60) playing = true;
     }
     const bool gotFrame = playing && xQueueReceive(playbackQueue, &frame, 0) == pdTRUE;
     if (!gotFrame || !active.load() || localOutputHold.load()) {
@@ -236,15 +251,17 @@ void playbackTask(void*) {
         gapSince = 0;
       } else if (++resumedFrames >= 3) gapSince = 0;
     }
-    if (level > 180) lastVoiced = millis();
-    if (volume.load()) {
-      if (level > 180) {
-        const uint32_t now = millis();
+    const bool audible = volume.load() != 0;
+    if (level > 180) {
+      const uint32_t now = millis();
+      lastVoiced = now;
+      playbackVoiceLagMs.store(now - frame.capturedMs, std::memory_order_relaxed);
+      if (audible) {
         echoUntil = now + 260;
         displaySpeechUntil.store(now + kDisplaySpeechTailMs, std::memory_order_relaxed);
       }
-      ui.observeSpeaker(level);
     }
+    if (audible) ui.observeSpeaker(level);
     // The fixture is acoustic input. Let the real mic hear it. Ordinary
     // assistant playback still receives the existing echo guard above.
     if (active.load() && !localOutputHold.load() && voiceTest::enabled()) {
@@ -338,6 +355,10 @@ void handleVoiceControl(const JsonDocument& doc) {
       stopConversation("Gesprek stoppen...", "user_stop", false);
       if (action == "stop") return;  // The bridge is already finalizing this session.
       accepted = true;
+    } else if (action == "align_head" && ui.ready() && !ui.sleeping() && head::requestAlignment()) {
+      localInputHold = localOutputHold = true;
+      stopConversation("Gesprek stoppen...", "user_stop", false);
+      accepted = true;
     } else if (action == "volume" && doc["percent"].is<int>()) {
       const int percent = doc["percent"].as<int>();
       if (percent >= 0 && percent <= 100) {
@@ -418,7 +439,9 @@ void onSocket(WStype_t event, uint8_t* data, size_t length) {
         localInputHold = localOutputHold = false;
         echoUntil = 0;
         starting = false;
-        prebufferFrames = WiFi.RSSI() <= -67 ? 105 : 90;
+        lastTxCongestionAt = 0;
+        playbackVoiceLagMs.store(0, std::memory_order_relaxed);
+        updatePlaybackPrebuffer(millis());
         active = true;
         loopMaxMs = sendMaxMs = recvServiceMaxMs = sendStalls = 0;
         txWaitSince = txWaitMaxMs = txWaitEvents = failedSendMs = 0;
@@ -471,7 +494,8 @@ void immediateUiCommand(UiCommand command, const UiSnapshot& snapshot) {
 }
 
 bool startConversation() {
-  if (ui.sleeping() || active.load() || starting || closing || !audioReady || !connected || protocolFault) return false;
+  if (ui.sleeping() || head::isAligning(head::alignment()) || active.load() || starting || closing ||
+      !audioReady || !connected || protocolFault) return false;
   clearAudio();
   lastStop = "none";
   lastBridgeError = "";
@@ -503,6 +527,14 @@ void handleUiCommands() {
       wakeRequestedAt = millis();
     } else if (command == UiCommand::Mute || command == UiCommand::Unmute) {
       requestMute(command == UiCommand::Mute);
+    } else if (command == UiCommand::AlignLeft) {
+      head::submitAlignment(head::AlignmentAction::Left);
+    } else if (command == UiCommand::AlignRight) {
+      head::submitAlignment(head::AlignmentAction::Right);
+    } else if (command == UiCommand::SaveAlignment) {
+      head::submitAlignment(head::AlignmentAction::Save);
+    } else if (command == UiCommand::CancelAlignment) {
+      head::submitAlignment(head::AlignmentAction::Cancel);
     }
   }
   // Avoid flash writes while the audio stream is active.
@@ -528,6 +560,7 @@ void publishUi(bool force = false) {
   snapshot.wifiConnected = WiFi.status() == WL_CONNECTED;
   snapshot.batteryPercent = batteryPercent();
   snapshot.volume = volume.load();
+  snapshot.alignment = head::alignment();
   status.toCharArray(snapshot.status, sizeof(snapshot.status));
   ui.publish(snapshot);
 }
@@ -679,6 +712,7 @@ void handleSerial() {
         voiceTest::diagnostics(diag["voice_test"].to<JsonObject>());
         diag["paired_pcm"] = pairedPcm;
         diag["prebuffer_frames"] = prebufferFrames.load();
+        diag["playback_voice_lag_ms"] = playbackVoiceLagMs.load(std::memory_order_relaxed);
         diag["speaking"] = static_cast<int32_t>(echoUntil.load()-millis()) > 0;
         diag["display_speaking"] = active.load() && volume.load() &&
             static_cast<int32_t>(displaySpeechUntil.load() - millis()) > 0;
@@ -725,7 +759,12 @@ void sendCapturedAudio() {
     const bool testBusy = voiceTest::enabled() && testTxStallUsed && static_cast<int32_t>(testTxResumeAt - now) > 0;
     if (testBusy || audioSocket.writeWouldBlock()) {
       if (!txWaitSince) { txWaitSince = now; ++txWaitEvents; }
-      txWaitMaxMs = std::max(txWaitMaxMs, now - txWaitSince);
+      const uint32_t blockedFor = now - txWaitSince;
+      txWaitMaxMs = std::max(txWaitMaxMs, blockedFor);
+      if (blockedFor >= 250) {
+        lastTxCongestionAt = now;
+        prebufferFrames = kSafePrebufferFrames;
+      }
       return;
     }
     txWaitSince = 0;
@@ -788,6 +827,8 @@ void maintainNetwork() {
     authHeader = "Authorization: Bearer " + cfg.token +
         "\r\nX-StackChan-Audio: pcm-pair-v1\r\nX-StackChan-Controls: voice-v1"
         "\r\nX-StackChan-Sleep: 1";
+    if (ui.ready() && M5.getBoard() == m5::board_t::board_M5StackChan)
+      authHeader += "\r\nX-StackChan-Align: 1";
     audioSocket.beginSslWithCA(cfg.host.c_str(), cfg.port, "/device", cfg.ca.c_str(), "");
     audioSocket.setExtraHeaders(authHeader.c_str());
     audioSocket.onEvent(onSocket);
@@ -812,6 +853,9 @@ void connectWifi() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  // On a mesh, a fast scan can stop at a distant AP advertising our SSID.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(cfg.ssid.c_str(), cfg.password.c_str());
   wifiSince = millis();
   status = "Wifi verbinden...";
@@ -922,7 +966,7 @@ void setup() {
     return static_cast<int32_t>(echoUntil.load() - millis()) > 0 ?
         head::State::Speaking : head::State::Listening;
   });
-  Serial.println("STACKCHAN_READY v30");
+  Serial.println("STACKCHAN_READY v33");
 }
 
 void loop() {
@@ -962,9 +1006,12 @@ void loop() {
     stopConversation("Microfoonstatus niet bevestigd", "mute_timeout");
   }
   if (!paused) {
+    const uint32_t now = millis();
+    if (active.load() && now - prebufferSampledAt >= kPrebufferSignalSampleMs) updatePlaybackPrebuffer(now);
     sendCapturedAudio();
     if (!active.load() || !txWaitSince) sendDiagnostics();
   }
+  if (head::takeAlignmentSaved()) status = "Middenstand bewaard";
   publishUi();
   loopMaxMs = std::max<uint32_t>(loopMaxMs, millis() - began);
   delay(1);

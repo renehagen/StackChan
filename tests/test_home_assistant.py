@@ -437,6 +437,40 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await client.execute("ha_FindTarget", {"name": "Verborgen opdracht", "domain": "script"}))["error"],
                          "target_not_found")
 
+    async def test_activate_short_scene_name_and_room_with_one_action(self):
+        for tool in self.fake.catalog[:2]:
+            tool["inputSchema"]["properties"].update(name={"type": "string"}, area={"type": "string"},
+                                                     domain={"type": "array"})
+        await self.client.initialize()
+        self.assertIn("ha_ActivateScene", {tool["name"] for tool in self.client.definitions()})
+        title = "Daglicht woonkamer op donkere dagen"
+        overview = f"- names: {title}\n  domain: scene\n"
+        calls = []
+
+        async def rpc(method, params):
+            calls.append(params)
+            text = "Activated" if params["name"] == "HassTurnOn" else json.dumps({"success": True, "result": overview})
+            return {"content": [{"type": "text", "text": text}]}
+
+        self.client._rpc = rpc
+        result = await self.client.execute("ha_ActivateScene", {"name": "Daglicht", "area": "Woonkamer"})
+        self.assertEqual((result["ok"], result["resolved_name"]), (True, title))
+        self.assertEqual(calls, [
+            {"name": "GetLiveContext", "arguments": {}},
+            {"name": "HassTurnOn", "arguments": {"name": title, "domain": ["scene"]}},
+        ])
+        for arguments in ({"name": "Daglicht Woonkamer Open"}, {"name": "Daglicht Woonkamer", "area": "Keuken"}):
+            result = await self.client.execute("ha_ActivateScene", arguments)
+            self.assertEqual(result["error"], "target_not_found")
+        self.assertEqual(len(calls), 2)
+
+        overview += "- names: Daglicht woonkamer op zonnige dagen\n  domain: scene\n"
+        self.client._catalog_until = 0
+        result = await self.client.execute("ha_ActivateScene", {"name": "Daglicht Woonkamer"})
+        self.assertEqual(result["error"], "target_ambiguous")
+        self.assertEqual(len(result["options"]), 2)
+        self.assertEqual([call["name"] for call in calls], ["GetLiveContext", "HassTurnOn", "GetLiveContext"])
+
     async def test_atoms3_color_uses_the_configured_script_once(self):
         self.fake.catalog[0]["inputSchema"]["properties"]["name"] = {"type": "string"}
         properties = {"name": {"type": "string"}, "color": {"type": "string"},

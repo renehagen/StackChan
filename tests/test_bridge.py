@@ -277,6 +277,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         controls = next(tool for tool in startup["session"]["delegation"]["responses"]["tools"]
                         if tool.get("name") == "stackchan_control")
         self.assertNotIn("sleep", controls["parameters"]["properties"]["action"]["enum"])
+        self.assertNotIn("align_head", controls["parameters"]["properties"]["action"]["enum"])
 
         async def call(action, **arguments):
             await self.fake.begin_response("response_" + action, "delegation_" + action)
@@ -352,6 +353,31 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         closed = await self.event(socket, "closed")
         self.assertEqual(closed["reason"], "user_stop")
         self.assertTrue(closed["usage_confirmed"])
+        await socket.close()
+
+    async def test_voice_alignment_opens_only_supported_devices_and_closes_after_ack(self):
+        socket = await connect(self.url, additional_headers={
+            "Authorization": f"Bearer {TOKEN}", "X-StackChan-Controls": "voice-v1",
+            "X-StackChan-Align": "1",
+        }, proxy=None)
+        await self.event(socket, "connected")
+        await self.start(socket)
+        startup = await self.fake.next("session.start")
+        self.assertIn("ik wil uitlijnen", startup["session"]["instructions"])
+        control = next(tool for tool in startup["session"]["delegation"]["responses"]["tools"]
+                       if tool.get("name") == "stackchan_control")
+        self.assertIn("align_head", control["parameters"]["properties"]["action"]["enum"])
+
+        await self.fake.begin_response("response_align", "delegation_align")
+        await self.fake.function_call("call_align", "stackchan_control", '{"action":"align_head"}', "delegation_align")
+        await self.fake.complete_response("response_align", "delegation_align")
+        command = await self.event(socket, "voice_control")
+        self.assertEqual(command["action"], "align_head")
+        await socket.send(bytes(FRAME_BYTES))
+        await self.fake.next("session.input_audio.append")
+        await socket.send(json.dumps({"type": "voice_control_ack", "id": command["id"], "ok": True}))
+        await self.fake.next("session.close")
+        self.assertEqual((await self.event(socket, "closed"))["reason"], "user_stop")
         await socket.close()
 
     async def test_upstream_error_is_redacted_and_finalized(self):

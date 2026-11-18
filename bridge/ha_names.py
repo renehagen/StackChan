@@ -10,6 +10,7 @@ import yaml
 
 _YAML_LOADER = getattr(yaml, "CBaseLoader", yaml.BaseLoader)
 _DIRECTIONS = frozenset({"left", "right", "links", "rechts", "boven", "beneden", "voor", "achter"})
+_SCENE_DIRECTIONS = _DIRECTIONS | {"open", "dicht", "gesloten", "omhoog", "omlaag", "aan", "uit", "on", "off"}
 _TYPE_WORDS = {"lamp": "light", "lampen": "light", "lampgroep": "light", "script": "script",
                "scene": "scene", "scène": "scene"}
 
@@ -82,6 +83,21 @@ def _lightstrip_name(label: str) -> str | None:
     return None
 
 
+def _words(label: str) -> tuple[str, ...]:
+    return tuple(map(name_key, re.findall(r"[^\W_]+", normalize("NFC", label))))
+
+
+def _scene_room_in_name(target: Target, area: str) -> bool:
+    room = _words(area)
+    if not room:
+        return False
+    for name in target.names:
+        words = _words(name)
+        if any(words[i:i + len(room)] == room for i in range(len(words) - len(room) + 1)):
+            return True
+    return False
+
+
 def _score(query: str, name: str, *, stripped: bool, domain: str) -> float:
     if query.casefold() == name.casefold():
         return 1.0 if stripped else 1.2
@@ -100,9 +116,9 @@ def _score(query: str, name: str, *, stripped: bool, domain: str) -> float:
                 return 1.0
             strip_names = True
     # Keep model numbers and explicit locations/directions distinct.
+    directions = _SCENE_DIRECTIONS if domain == "scene" else _DIRECTIONS
     if (min(len(left), len(right)) < (5 if strip_names else 6)
-            or _DIRECTIONS.intersection(re.findall(r"\w+", query.casefold()))
-            != _DIRECTIONS.intersection(re.findall(r"\w+", name.casefold()))):
+            or directions.intersection(_words(query)) != directions.intersection(_words(name))):
         return 0.0
     matcher = SequenceMatcher(None, left, right, autojunk=False)
     edits = sum(max(b - a, d - c) for op, a, b, c, d in matcher.get_opcodes() if op != "equal")
@@ -115,22 +131,40 @@ def find_targets(query: str, targets: list[Target], *, domains: tuple[str, ...] 
                  area: str | None = None) -> list[Target]:
     variants = _name_variants(query)
     area_key = name_key(area) if area else None
+    scene_only = domains == ("scene",)
+    leads = {_words(value) for value, inferred in variants if inferred in (None, "scene")} if scene_only else set()
+    if leads and area:
+        room = _words(area)
+        leads |= {lead + room for lead in leads}
+    leads = {lead for lead in leads if len(lead) >= 2}
     scored = []
+    prefixes: list[tuple[Target, bool]] = []
     for target in targets:
         if domains and target.domain not in domains:
             continue
         if area_key and area_key not in {name_key(value) for value in target.areas}:
-            continue
+            if not (scene_only and not target.areas and _scene_room_in_name(target, area)):
+                continue
         score = max((_score(value, name, stripped=bool(inferred), domain=target.domain)
                      for value, inferred in variants if inferred in (None, target.domain)
                      for name in target.names), default=0.0)
         if score:
             scored.append((score, target))
+        elif leads:
+            # A shortened title must match whole words. Keep competing titles
+            # in the results so an omitted qualifier cannot pick one silently.
+            tails = [words[len(lead):] for words in map(_words, target.names)
+                     for lead in leads if len(lead) < len(words) and words[:len(lead)] == lead]
+            if tails:
+                safe = any(not _SCENE_DIRECTIONS.intersection(tail)
+                           and not any(re.search(r"\d", word) for word in tail) for tail in tails)
+                prefixes.append((target, safe))
     if not scored:
-        return []
-    best = max(score for score, _ in scored)
-    # Exact and normalized matches outrank edits. Close edit scores are ambiguous.
-    matches = [target for score, target in scored if score == best or best < 1 and best - score < .09]
+        matches = [target for target, safe in prefixes if safe or len(prefixes) > 1]
+    else:
+        best = max(score for score, _ in scored)
+        # Exact and normalized matches outrank edits. Close edit scores are ambiguous.
+        matches = [target for score, target in scored if score == best or best < 1 and best - score < .09]
     if len(matches) == 1 and not matches[0].tool:
         chosen = matches[0]
         # The downstream Assist command uses this exact name, domain and area.

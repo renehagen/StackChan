@@ -18,6 +18,8 @@ constexpr int kLegMs = 470;
 constexpr uint32_t kBetweenGesturesMs = 7800;
 constexpr uint8_t kTorque = 40, kGoal = 42, kFeedback = 56;
 constexpr int kMinimumUprightOffset = 16, kDefaultUprightOffset = 48;
+constexpr char kYawCenterKey[] = "yaw_center";
+constexpr int kAlignmentStep = 8, kYawTolerance = 5;
 struct Axis {
   uint8_t id;
   int low, high, excursion;
@@ -36,6 +38,9 @@ std::atomic<int> lastRxBytes{0}, lastServoStatus{0};
 std::atomic<int> vmConfig{-1}, vmOut{-1}, vmIn{-1}, batteryMv{-1};
 std::atomic<int> standbyFrom{-1}, standbyAt{-1}, wakeAt{-1};
 std::atomic<bool> standbyParked{false};
+std::atomic<Alignment> alignmentState{Alignment::Off};
+std::atomic<AlignmentAction> alignmentAction{AlignmentAction::None};
+std::atomic<int> savedYawCenter{-1}, alignmentYaw{-1}, wakeYaw{-1}, conversationYaw{-1};
 
 bool setServoPower(bool on) {
   auto& bus = M5.In_I2C;
@@ -105,10 +110,10 @@ bool torque(uint8_t id, bool enabled) {
   return sendPacket(0xfe, 0x83, args, sizeof(args));
 }
 
-bool goal(uint8_t id, int position) {
+bool goal(uint8_t id, int position, int duration = kLegMs) {
   const uint8_t args[] = {kGoal, 6, id, static_cast<uint8_t>(position >> 8),
-      static_cast<uint8_t>(position), static_cast<uint8_t>(kLegMs >> 8),
-      static_cast<uint8_t>(kLegMs & 255), 0, 0};
+      static_cast<uint8_t>(position), static_cast<uint8_t>(duration >> 8),
+      static_cast<uint8_t>(duration), 0, 0};
   return sendPacket(0xfe, 0x83, args, sizeof(args));
 }
 
@@ -149,6 +154,7 @@ void disable(const char* reason) {
 }
 
 bool keepGoing(bool test) {
+  if (isAligning(alignmentState.load())) return false;
   const auto state = readState();
   return state != State::Sleeping && (state == State::Idle) == test;
 }
@@ -190,15 +196,96 @@ Result gesture(const Axis& a, int sign, bool test) {
   return Result::Done;
 }
 
-bool movePitch(int target, std::atomic<int>& arrived) {
-  if (!goal(pitch.id, target) || !torque(pitch.id, true)) {
-    release(pitch.id);
+bool moveAxis(uint8_t id, int target, std::atomic<int>& arrived, int tolerance, int duration = kLegMs) {
+  if (!goal(id, target, duration) || !torque(id, true)) {
+    if (!release(id)) setServoPower(false);
     return false;
   }
-  vTaskDelay(pdMS_TO_TICKS(kLegMs + 150));
-  const int actual = position(pitch.id);
+  vTaskDelay(pdMS_TO_TICKS(duration + 150));
+  const int actual = position(id);
   arrived = actual;
-  return release(pitch.id) && actual >= 0 && abs(actual - target) <= 8;
+  if (!release(id)) {
+    setServoPower(false);
+    return false;
+  }
+  return actual >= 0 && abs(actual - target) <= tolerance;
+}
+
+bool movePitch(int target, std::atomic<int>& arrived) {
+  return moveAxis(pitch.id, target, arrived, 8);
+}
+
+bool validYaw(int value) { return value >= yaw.low && value <= yaw.high; }
+
+int currentYaw() {
+  const int current = position(yaw.id);
+  return current >= 0 ? current : position(yaw.id);
+}
+
+bool moveYaw(int current, int target, std::atomic<int>& arrived) {
+  arrived = current;
+  if (!validYaw(current) || !validYaw(target)) return false;
+  if (current == target) return true;
+  const int duration = kLegMs + std::min(1000, abs(current - target) * 2);
+  return moveAxis(yaw.id, target, arrived, kYawTolerance, duration);
+}
+
+bool centerYaw(std::atomic<int>& arrived) {
+  const int target = savedYawCenter.load();
+  if (target < 0) return true;
+  const int current = currentYaw();
+  if (validYaw(current) && abs(current - target) <= kYawTolerance) {
+    arrived = current;
+    return true;
+  }
+  return moveYaw(current, target, arrived);
+}
+
+void serviceAlignment(int& startingYaw) {
+  if (alignmentState.load() == Alignment::Opening) {
+    startingYaw = currentYaw();
+    alignmentYaw = startingYaw;
+    alignmentState = validYaw(startingYaw) ? Alignment::Ready : Alignment::PositionError;
+    return;
+  }
+  const auto action = alignmentAction.exchange(AlignmentAction::None);
+  if (action == AlignmentAction::None) return;
+  const bool powered = ready.load();
+  const int current = powered ? currentYaw() : -1;
+  alignmentYaw = current;
+  if (action == AlignmentAction::Cancel) {
+    if (powered && validYaw(startingYaw) && !moveYaw(current, startingYaw, alignmentYaw)) {
+      disable("alignment_restore");
+    }
+    alignmentState = Alignment::Off;
+    return;
+  }
+  if (!validYaw(current)) {
+    alignmentState = Alignment::PositionError;
+    return;
+  }
+  if (!validYaw(startingYaw)) startingYaw = current;
+  if (action == AlignmentAction::Save) {
+    Preferences calibration;
+    bool stored = current == savedYawCenter.load();
+    if (!stored && calibration.begin("servo", false)) {
+      stored = calibration.putInt(kYawCenterKey, current) == sizeof(int32_t) &&
+          calibration.getInt(kYawCenterKey, -1) == current;
+      calibration.end();
+    }
+    if (stored) savedYawCenter = current;
+    alignmentState = stored ? Alignment::Saved : Alignment::SaveError;
+    return;
+  }
+  // M5Stack's yaw convention uses larger raw positions for a left turn.
+  const int delta = action == AlignmentAction::Left ? kAlignmentStep : -kAlignmentStep;
+  const int target = std::max(yaw.low, std::min(yaw.high, current + delta));
+  if (!moveYaw(current, target, alignmentYaw)) {
+    disable("alignment_move");
+    alignmentState = Alignment::PositionError;
+  } else {
+    alignmentState = Alignment::Ready;
+  }
 }
 
 void run(void*) {
@@ -209,6 +296,7 @@ void run(void*) {
   const bool saved = calibration.begin("servo", true);
   const int zeroYaw = saved ? zeroPosition(calibration, "zero_pos_1", 460) : 460;
   const int zeroPitch = saved ? zeroPosition(calibration, "zero_pos_2", 620) : 620;
+  const int userCenter = saved ? calibration.getInt(kYawCenterKey, -1) : -1;
   if (saved) calibration.end();
   bool yawOk = false, pitchOk = false;
   for (int attempt = 0; attempt < 6; ++attempt) {
@@ -228,6 +316,10 @@ void run(void*) {
   if (!release(yaw.id) || !release(pitch.id)) {
     disable("torque_release"); vTaskDelete(nullptr); return;
   }
+  if (validYaw(userCenter)) savedYawCenter = userCenter;
+  if (!centerYaw(conversationYaw)) {
+    disable("startup_yaw"); vTaskDelete(nullptr); return;
+  }
   status = "ready";
   ready = true;
   unsigned phase = 0;
@@ -237,8 +329,13 @@ void run(void*) {
   const int uprightThreshold = pitch.low + kMinimumUprightOffset;
   const int defaultUpright = std::min(pitch.high, pitch.low + kDefaultUprightOffset);
   int wakePitch = defaultUpright;
+  int alignmentStart = -1;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(40));
+    if (!ready.load()) {
+      if (isAligning(alignmentState.load())) serviceAlignment(alignmentStart);
+      continue;
+    }
     const bool test = testPending.exchange(false);
     const auto state = readState();
     if (state == State::Sleeping) {
@@ -249,7 +346,7 @@ void run(void*) {
         // angle. Use a calibrated wake pose when there is no higher pose to save.
         wakePitch = current >= uprightThreshold && current <= pitch.high ? current : defaultUpright;
         standbyFrom = current;
-        standbyAt = wakeAt = -1;
+        standbyAt = wakeAt = wakeYaw = -1;
         if (current >= pitch.low && current <= pitch.high) {
           // The calibrated 5-degree minimum is already inside the mechanical range.
           const int target = pitch.low;
@@ -293,8 +390,15 @@ void run(void*) {
       if (!movePitch(wakePitch, wakeAt)) {
         disable("wake_pitch"); vTaskDelete(nullptr); return;
       }
+      if (!centerYaw(wakeYaw)) {
+        disable("wake_yaw"); vTaskDelete(nullptr); return;
+      }
       status = "ready";
       last = millis();
+      continue;
+    }
+    if (isAligning(alignmentState.load())) {
+      serviceAlignment(alignmentStart);
       continue;
     }
     if (conversationPosePending.exchange(false)) {
@@ -313,6 +417,9 @@ void run(void*) {
           disable("conversation_pitch"); vTaskDelete(nullptr); return;
         }
         last = millis();
+      }
+      if (!centerYaw(conversationYaw)) {
+        disable("conversation_yaw"); vTaskDelete(nullptr); return;
       }
       status = "ready";
       continue;
@@ -346,10 +453,31 @@ void begin(StateReader state) {
 }
 
 bool requestTest() {
-  return ready && strcmp(status.load(), "moving") != 0 && !testPending.exchange(true);
+  return ready && !isAligning(alignmentState.load()) &&
+      strcmp(status.load(), "moving") != 0 && !testPending.exchange(true);
 }
 
 void requestConversationPose() { conversationPosePending = true; }
+
+bool requestAlignment() {
+  auto expected = Alignment::Off;
+  return ready.load() && alignmentState.compare_exchange_strong(expected, Alignment::Opening);
+}
+
+Alignment alignment() { return alignmentState.load(); }
+
+bool submitAlignment(AlignmentAction action) {
+  auto expected = alignmentState.load();
+  if (!canAdjust(expected) || action == AlignmentAction::None) return false;
+  if (!alignmentState.compare_exchange_strong(expected, Alignment::Busy)) return false;
+  alignmentAction = action;
+  return true;
+}
+
+bool takeAlignmentSaved() {
+  auto expected = Alignment::Saved;
+  return alignmentState.compare_exchange_strong(expected, Alignment::Off);
+}
 
 bool standbySettled() { return standbyParked.load() || !ready.load(); }
 
@@ -377,6 +505,11 @@ void diagnostics(JsonObject out) {
   out["standby_from"] = standbyFrom.load();
   out["standby_at"] = standbyAt.load();
   out["wake_at"] = wakeAt.load();
+  out["wake_yaw_at"] = wakeYaw.load();
+  out["conversation_yaw_at"] = conversationYaw.load();
+  out["alignment"] = static_cast<uint8_t>(alignmentState.load());
+  out["alignment_yaw"] = alignmentYaw.load();
+  out["yaw_center"] = savedYawCenter.load();
   out["conversation_checks"] = conversationChecks.load();
   out["conversation_from"] = conversationFrom.load();
   out["conversation_at"] = conversationAt.load();

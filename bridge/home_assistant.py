@@ -40,6 +40,7 @@ ALIAS_LIMIT = 32
 TARGET_DOMAINS = frozenset({"light", "switch", "scene", "fan", "climate", "media_player", "script"})
 SAVE_ALIAS_TOOL = "ha_SaveAlias"
 FIND_TARGET_TOOL = "ha_FindTarget"
+ACTIVATE_SCENE_TOOL = "ha_ActivateScene"
 ATOMS3_TOOL = "ha_script_stackchan_atoms3_ledstrip"
 ATOMS3_NAME = "AtomS3 LED Strip"
 CATALOG_TTL = 45
@@ -482,6 +483,17 @@ class HomeAssistantTools:
                     "name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "string"},
                 }, "required": ["name"], "additionalProperties": False},
             }
+        turn_on_properties = tools.get("ha_HassTurnOn", {}).get("parameters", {}).get("properties", {})
+        if FIND_TARGET_TOOL in tools and {"name", "domain"} <= turn_on_properties.keys():
+            tools[ACTIVATE_SCENE_TOOL] = {
+                "type": "function", "name": ACTIVATE_SCENE_TOOL, "strict": False,
+                "description": ("Activate one exposed Home Assistant scene by its spoken name. "
+                                "Use for an explicit request to activate a scene. Pass the scene name "
+                                "and optional room. The bridge resolves the name before turning on the scene."),
+                "parameters": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "area": {"type": "string"},
+                }, "required": ["name"], "additionalProperties": False},
+            }
         if self._cache_path and "ha_GetLiveContext" in tools:
             tools[SAVE_ALIAS_TOOL] = {
                 "type": "function", "name": SAVE_ALIAS_TOOL, "strict": False,
@@ -548,6 +560,9 @@ class HomeAssistantTools:
         if matches:
             return {"ok": False, "error": "target_ambiguous", "options": [row.reference() for row in matches[:5]],
                     "feedback": "Meerdere doelen komen overeen. Vraag welk apparaat, script of welke scène is bedoeld."}
+        if domains == ("scene",):
+            return {"ok": False, "error": "target_not_found",
+                    "feedback": "Ik vind geen vrijgegeven scène met die naam. Vraag naar de volledige naam in Home Assistant."}
         return {"ok": False, "error": "target_not_found", "feedback": "Geen eenduidige vrijgegeven naam gevonden."}
 
     async def _resolve_operation(self, tool: str, arguments: dict[str, Any], label: str,
@@ -569,6 +584,8 @@ class HomeAssistantTools:
         properties = self._tools[name]["parameters"].get("properties", {})
         if target.get("area") and "area" in properties:
             rewritten["area"] = target["area"]
+        elif target["domain"] == "scene":
+            rewritten.pop("area", None)
         if "domain" in properties:
             rewritten["domain"] = [target["domain"]] if properties["domain"].get("type") == "array" else target["domain"]
         return rewritten
@@ -774,13 +791,22 @@ class HomeAssistantTools:
                 return await self._save_alias(arguments)
             label = _spoken_label(arguments.get("name"))
             area = _spoken_label(arguments.get("area"))
+            if name == ACTIVATE_SCENE_TOOL:
+                if not label or (arguments.get("area") is not None and not area) or set(arguments) - {"name", "area"}:
+                    return {"ok": False, "error": "invalid_tool_arguments"}
+                target = await self.execute(FIND_TARGET_TOOL, {**arguments, "domain": "scene"})
+                if not target.get("ok"):
+                    return target
+                command = self._named_arguments("ha_HassTurnOn", {"name": target["name"]}, target)
+                result = await self.execute("ha_HassTurnOn", command, _resolve_name=False, _resolve_alias=False)
+                return {**result, "resolved_name": target["name"], "resolved_domain": "scene"}
             domains = _domains(arguments.get("domain"))
             valid_scope = domains is not None and (arguments.get("area") is None or bool(area))
             alias = self._aliases.get(_alias_key(label)) if _resolve_alias and not name.startswith("ha_script_") else None
             if name == FIND_TARGET_TOOL:
                 if not label or not valid_scope or set(arguments) - {"name", "area", "domain"}:
                     return {"ok": False, "error": "invalid_tool_arguments"}
-                if alias:
+                if alias and (domains != ("scene",) or alias["domain"] == "scene"):
                     if (domains and alias["domain"] not in domains) or (area and alias["area"] and name_key(area) != name_key(alias["area"])):
                         return {"ok": False, "error": "alias_scope_mismatch"}
                     reference = {k: alias[k] for k in ("name", "area", "domain")}

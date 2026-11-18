@@ -1,5 +1,6 @@
 #pragma once
 
+#include "HeadMotion.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -15,6 +16,10 @@ enum class UiCommand : uint8_t {
   Unmute,
   VolumeDown,
   VolumeUp,
+  AlignLeft,
+  AlignRight,
+  SaveAlignment,
+  CancelAlignment,
 };
 
 struct UiSnapshot {
@@ -28,6 +33,7 @@ struct UiSnapshot {
   int8_t batteryPercent = -1;
   uint8_t volume = 90;
   bool speaking = false;
+  head::Alignment alignment = head::Alignment::Off;
   char status[80]{};
 };
 

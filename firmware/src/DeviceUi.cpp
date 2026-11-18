@@ -48,6 +48,8 @@ constexpr Rect kBody{0, 40, 320, 153};
 constexpr Rect kVolumePanel{0, 145, 320, 48};
 constexpr Rect kMic{6, 196, 98, 39}, kVolume{111, 196, 98, 39}, kSession{216, 196, 98, 39};
 constexpr Rect kMinus{58, 148, 56, 42}, kPlus{206, 148, 56, 42};
+constexpr Rect kAlignLeft{24, 83, 128, 67}, kAlignRight{168, 83, 128, 67};
+constexpr Rect kAlignCancel{24, 186, 128, 43}, kAlignSave{168, 186, 128, 43};
 
 Rect unite(Rect a, Rect b) {
   if (!a.h) return b;
@@ -121,6 +123,47 @@ void idleStatus(Canvas& c, const UiSnapshot& s) {
   c.setTextColor(kWhite, kBackground);
   c.setTextDatum(middle_center);
   c.drawString(label, kWidth / 2, kHeight / 2);
+}
+
+void alignmentScreen(Canvas& c, const UiSnapshot& s) {
+  c.fillScreen(kBackground);
+  statusLine(c, s);
+  c.setTextSize(1);
+  c.setTextDatum(middle_center);
+  c.setFont(&fonts::FreeSansBold12pt7b);
+  c.setTextColor(kWhite, kBackground);
+  c.drawString("Middenstand uitlijnen", kWidth / 2, 57);
+
+  const bool adjustable = head::canAdjust(s.alignment);
+  const uint32_t arrowColor = adjustable ? kWhite : kMuted;
+  for (const Rect& r : {kAlignLeft, kAlignRight}) {
+    c.fillSmoothRoundRect(r.x, r.y, r.w, r.h, 12, kButton);
+    const int x = r.x + r.w / 2, y = r.y + r.h / 2;
+    const int direction = r.x < kWidth / 2 ? -1 : 1;
+    const int tip = x + direction * 13, base = x - direction * 3;
+    c.drawWideLine(x - direction * 14, y, tip, y, 3, arrowColor);
+    c.drawWideLine(base, y - 13, tip, y, 3, arrowColor);
+    c.drawWideLine(base, y + 13, tip, y, 3, arrowColor);
+  }
+
+  c.setFont(&fonts::FreeSansBold9pt7b);
+  const char* status = "";
+  switch (s.alignment) {
+    case head::Alignment::Opening: status = "Hoofdpositie lezen..."; break;
+    case head::Alignment::Busy: status = "Even wachten..."; break;
+    case head::Alignment::PositionError: status = "Hoofdpositie niet bevestigd"; break;
+    case head::Alignment::SaveError: status = "Bewaren mislukt. Probeer opnieuw."; break;
+    default: break;
+  }
+  c.setTextColor(kMuted, kBackground);
+  c.drawString(status, kWidth / 2, 166);
+  for (const Rect& r : {kAlignCancel, kAlignSave}) {
+    const bool save = r.x > kWidth / 2;
+    const uint32_t bg = save && adjustable ? 0x21463E : kButton;
+    c.fillSmoothRoundRect(r.x, r.y, r.w, r.h, 8, bg);
+    c.setTextColor(adjustable ? (save ? kMint : kWhite) : kMuted, bg);
+    c.drawString(save ? "Bewaar" : "Annuleer", r.x + r.w / 2, r.y + r.h / 2);
+  }
 }
 
 enum class Icon { Mic, Muted, Speaker, Stop, Play };
@@ -598,7 +641,7 @@ void DeviceUi::run() {
     if (xQueueReceive(snapshots_, &incoming, 0) == pdTRUE) current = incoming;
     M5.update();
     const uint32_t now = millis();
-    const bool busy = current.active || current.starting || current.closing;
+    const bool busy = current.active || current.starting || current.closing || head::isAligning(current.alignment);
     const bool screenTouch = M5.Touch.getDetail().wasPressed();
     bool topPressed = false;
     if (topTouchReady() && now - lastTopPoll >= kTopTouchPollMs) {
@@ -679,14 +722,22 @@ void DeviceUi::handleTouch(const UiSnapshot& snapshot) {
   const uint32_t now = millis();
   if (hasAcceptedTouch_ && now - lastTouchAt_ < kTouchDebounceMs) return;
   controlsTouchedAt_ = now;
-  if (!controlsVisible()) {
+  const bool aligning = head::isAligning(snapshot.alignment);
+  if (!aligning && !controlsVisible()) {
     lastTouchAt_ = now;
     hasAcceptedTouch_ = true;
     return;
   }
   const int x = touch.x, y = touch.y;
   UiCommand command;
-  if (kVolume.contains(x, y)) {
+  if (aligning) {
+    if (!head::canAdjust(snapshot.alignment)) return;
+    if (kAlignLeft.contains(x, y)) command = UiCommand::AlignLeft;
+    else if (kAlignRight.contains(x, y)) command = UiCommand::AlignRight;
+    else if (kAlignSave.contains(x, y)) command = UiCommand::SaveAlignment;
+    else if (kAlignCancel.contains(x, y)) command = UiCommand::CancelAlignment;
+    else return;
+  } else if (kVolume.contains(x, y)) {
     volumeOpen_ = !paintedVolumeOpen_;
     volumeTouchedAt_ = lastTouchAt_ = now;
     hasAcceptedTouch_ = true;
@@ -715,6 +766,22 @@ void DeviceUi::handleTouch(const UiSnapshot& snapshot) {
 
 void DeviceUi::render(const UiSnapshot& s, uint32_t now) {
   auto& c = *canvas_;
+  if (head::isAligning(s.alignment)) {
+    if (firstPaint_ || s.alignment != painted_.alignment || s.wifiConnected != painted_.wifiConnected ||
+        s.batteryPercent != painted_.batteryPercent) {
+      alignmentScreen(c, s);
+      c.pushSprite(0, 0);
+    }
+    volumeOpen_ = false;
+    controlsVisible_ = false;
+    panelButtonMask_ = 0;
+    paintedHeartAge_ = -1;
+    waveMode_ = WaveMode::Idle;
+    painted_ = s;
+    firstPaint_ = false;
+    return;
+  }
+  if (head::isAligning(painted_.alignment)) firstPaint_ = true;
   const bool first = firstPaint_;
   if (first || s.active != painted_.active) controlsTouchedAt_ = now;
   const bool visible = !s.active || now - controlsTouchedAt_ < kControlsTimeoutMs;

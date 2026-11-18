@@ -56,6 +56,10 @@ VOICE_SLEEP_INSTRUCTIONS = (
     "Delegeer 'ga slapen', 'ga in slaapstand' of 'zet jezelf in stand-by' meteen als StackChan-opdracht. "
     "Gebruik stackchan_control met action sleep als de gebruiker de StackChan in slaap wil zetten. "
 )
+VOICE_ALIGNMENT_INSTRUCTIONS = (
+    "Delegeer 'lijn je hoofd uit', 'ik wil uitlijnen' of 'kalibreer je middenstand' meteen als "
+    "StackChan-opdracht. Gebruik stackchan_control met action align_head om het uitlijnscherm te openen. "
+)
 LOGGER = logging.getLogger("stackchan")
 DEVICE_STOP_REASONS = frozenset({
     "user_stop", "capture_overflow", "playback_overflow", "audio_io", "wifi_lost",
@@ -173,7 +177,8 @@ class Config:
                 names.add(definition["name"])
             object.__setattr__(self, "_functions", tuple(definitions))
 
-    def start_event(self, *, voice_controls: bool = False, voice_sleep: bool = False) -> dict[str, Any]:
+    def start_event(self, *, voice_controls: bool = False, voice_sleep: bool = False,
+                    voice_alignment: bool = False) -> dict[str, Any]:
         tools = ([{"type": "web_search"}] if self.web_search else []) + list(self._functions)
         controls = VOICE_CONTROL_INSTRUCTIONS if voice_controls else ""
         live_controls = (
@@ -191,6 +196,11 @@ class Config:
                 description += " Use sleep to end the conversation and put StackChan to sleep immediately."
                 controls += VOICE_SLEEP_INSTRUCTIONS
                 live_controls += VOICE_SLEEP_INSTRUCTIONS
+            if voice_alignment:
+                actions.append("align_head")
+                description += " Use align_head to open the touchscreen calibration of the head's center position."
+                controls += VOICE_ALIGNMENT_INSTRUCTIONS
+                live_controls += VOICE_ALIGNMENT_INSTRUCTIONS
             tools.append({
                 "type": "function", "name": VOICE_CONTROL_NAME, "strict": False,
                 "description": description,
@@ -262,8 +272,9 @@ class Config:
                             "in het name-argument van de gewenste Home Assistant-tool. Sla bij een exacte alias de "
                             "zoekstap over. Voor scripts met parameters gebruik je de passende ha_script_-tool. "
                             "Type gaat vóór naam: "
-                            "als de gebruiker 'scène' of 'scene' zegt, zoek die scène op met domein scene en "
-                            "activeer die met ha_HassTurnOn. Gebruik bij een scèneverzoek nooit een ha_script_-tool, "
+                            "gebruik bij een expliciet verzoek om een scène te activeren ha_ActivateScene als die tool "
+                            "beschikbaar is. Geef de uitgesproken naam en eventueel de ruimte door. "
+                            "Gebruik anders ha_FindTarget en ha_HassTurnOn met domein scene. Gebruik bij een scèneverzoek nooit een ha_script_-tool, "
                             "ook als de alias gelijk is. Gebruik bij "
                             "een expliciet verzoek om een script de passende ha_script_-tool. "
                             "Herken het script aan de naam en de aliassen in de toolbeschrijving. "
@@ -279,10 +290,10 @@ class Config:
                             "Dat geldt ook voor samenstellingen zoals 'eettafellamp' → 'Eettafel'. "
                             "Gebruik het soortwoord alleen om de verkorte match tot dat domein te beperken "
                             "(lamp en lampgroep: light, scène: scene, script: ha_script_). "
-                            "Activeer een bevestigde scène met ha_HassTurnOn en domein scene. "
                             "Bij een exacte volledige match met een andere naam dan de verkorte variant gebruik je de "
                             "volledige match. Bij twijfel vraag je het na. "
-                            "Gebruik ha_FindTarget indien beschikbaar bij een nieuw of afwijkend gespeld doel. "
+                            "Gebruik ha_FindTarget indien beschikbaar bij een nieuw of afwijkend gespeld doel, "
+                            "behalve bij een activatie die ha_ActivateScene zelf opzoekt. "
                             "Geef daarbij de uitgesproken naam, opgegeven ruimte en expliciet genoemde soort. "
                             "Zoek twee namen afzonderlijk. Gebruik bij een geslaagde match de opgegeven naam, "
                             "ruimte en het domein uit het resultaat. Gebruik voor scripts de teruggegeven tool "
@@ -343,7 +354,7 @@ class LiveSession:
     """One paid session. A terminal condition never reconnects automatically."""
 
     def __init__(self, device: DeviceConnection, config: Config, upstream_url: str, *, paired_pcm: bool = False,
-                 voice_controls: bool = False, voice_sleep: bool = False) -> None:
+                 voice_controls: bool = False, voice_sleep: bool = False, voice_alignment: bool = False) -> None:
         self.device = device
         self.paired_pcm = paired_pcm
         self.config = config
@@ -372,6 +383,7 @@ class LiveSession:
         self.allowed_functions = {definition["name"] for definition in config._functions}
         self.voice_controls = voice_controls
         self.voice_sleep = voice_sleep
+        self.voice_alignment = voice_alignment
         self.control_request_id = 0
         self.control_ack: asyncio.Future[bool] | None = None
         if voice_controls:
@@ -656,6 +668,7 @@ class LiveSession:
         else:
             valid = set(arguments) == {"action"} and (
                 action in ("stop", "mute") or (action == "sleep" and self.voice_sleep)
+                or (action == "align_head" and self.voice_alignment)
             )
         if not valid:
             return {"ok": False, "error": "invalid_device_control"}
@@ -678,7 +691,7 @@ class LiveSession:
                        **({"percent": percent} if action == "volume" else {}))
         if not accepted:
             return {"ok": False, "error": "device_control_rejected"}
-        if action == "sleep":
+        if action in ("sleep", "align_head"):
             self.stop("user_stop")
             return {"ok": True}
         return {"ok": True, **({"percent": percent} if action == "volume" else {"muted": True})}
@@ -1034,6 +1047,7 @@ class LiveSession:
                     return
                 await upstream.send(json.dumps(self.config.start_event(
                     voice_controls=self.voice_controls, voice_sleep=self.voice_sleep,
+                    voice_alignment=self.voice_alignment,
                 )))
                 reader = asyncio.create_task(self._reader(upstream))
                 stop_wait = asyncio.create_task(self.stop_event.wait())
@@ -1146,7 +1160,9 @@ class LiveBridge:
         paired_pcm = socket.request.headers.get_all("X-StackChan-Audio") == ["pcm-pair-v1"]
         voice_controls = socket.request.headers.get_all("X-StackChan-Controls") == ["voice-v1"]
         voice_sleep = voice_controls and socket.request.headers.get_all("X-StackChan-Sleep") == ["1"]
-        log_diagnostic("device_connected", connection=connection_id, voice_controls=voice_controls, voice_sleep=voice_sleep)
+        voice_alignment = voice_controls and socket.request.headers.get_all("X-StackChan-Align") == ["1"]
+        log_diagnostic("device_connected", connection=connection_id, voice_controls=voice_controls,
+                       voice_sleep=voice_sleep, voice_alignment=voice_alignment)
         device = DeviceConnection(socket, self.config, paired_pcm=paired_pcm)
         session: LiveSession | None = None
         task: asyncio.Task[Any] | None = None
@@ -1185,7 +1201,8 @@ class LiveBridge:
                         await device.error("already_started")
                     else:
                         session = LiveSession(device, self.config, self.upstream_url, paired_pcm=paired_pcm,
-                                              voice_controls=voice_controls, voice_sleep=voice_sleep)
+                                              voice_controls=voice_controls, voice_sleep=voice_sleep,
+                                              voice_alignment=voice_alignment)
                         task = asyncio.create_task(session.run())
                 elif kind == "stop" and (set(command) == {"type"} or (
                     set(command) == {"type", "reason"} and isinstance(command["reason"], str)
