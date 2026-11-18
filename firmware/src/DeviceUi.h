@@ -54,9 +54,16 @@ class DeviceUi {
   uint32_t speakingWaveFrames() const { return speakingWaveFrames_.load(std::memory_order_relaxed); }
   bool controlsVisible() const { return controlsVisible_.load(); }
   bool sleeping() const { return sleeping_.load(); }
+  bool headLedsIdle() const {
+    return !headLedsSupported_ || headLedMode_.load(std::memory_order_relaxed) == HeadLedMode::Off;
+  }
   void requestSleep() { sleepRequested_ = true; }
   bool topTouchReady() const { return topTouchReady_.load(); }
   uint32_t topWakes() const { return topWakes_.load(std::memory_order_relaxed); }
+  uint32_t heartBursts() const { return heartBursts_.load(std::memory_order_relaxed); }
+  uint32_t heartFrames() const { return heartFrames_.load(std::memory_order_relaxed); }
+  const char* headLedState() const;
+  uint32_t headLedFailures() const { return headLedFailures_.load(std::memory_order_relaxed); }
   uint8_t panelButtonMask() const { return panelButtonMask_.load(); }
   bool ready() const { return ready_.load(std::memory_order_acquire); }
   uint32_t maxRenderMs() const {
@@ -72,10 +79,19 @@ class DeviceUi {
   static void taskEntry(void* context);
   void run();
   void handleTouch(const UiSnapshot& snapshot);
+  bool setHeadLedPower(bool on);
   void render(const UiSnapshot& snapshot, uint32_t now);
   void releaseBeforeTask();
 
   enum class WaveMode : uint8_t { Idle, Listening, Speaking, Muted };
+  enum class HeadLedMode : uint8_t { Unknown, Off, Green, Orange, Pulse };
+  struct HeadLedRequest {
+    HeadLedMode mode;
+    uint32_t startedAt, duration;
+  };
+  void requestHeadLed(HeadLedMode mode, uint32_t now);
+  void updateHeadLeds(const HeadLedRequest& request, uint32_t now);
+  void runHeadLeds();
   const std::atomic<uint32_t>& speakingUntil_;
   std::atomic<uint32_t> micPeak_{0}, speakerPeak_{0};
   std::atomic<uint32_t> listeningWaveFrames_{0}, speakingWaveFrames_{0};
@@ -101,6 +117,19 @@ class DeviceUi {
   bool firstPaint_ = true;
   std::atomic<bool> sleeping_{false}, sleepRequested_{false}, topTouchReady_{false};
   std::atomic<uint32_t> topWakes_{0};
+  std::atomic<uint32_t> heartBursts_{0}, heartFrames_{0};
+  QueueHandle_t headLedRequests_ = nullptr;
+  bool headLedsSupported_ = false;
+  HeadLedRequest lastHeadLedRequest_{HeadLedMode::Off, 0, 0};
+  std::atomic<HeadLedMode> headLedMode_{HeadLedMode::Unknown};
+  std::atomic<uint32_t> headLedFailures_{0};
+  uint16_t headLedColor_ = 0;
+  uint32_t headLedRetryAt_ = 0;
+  bool headLedsConfigured_ = false;
+  bool headLedOwnsBusPower_ = false, headLedOwnsBoost_ = false;
+  uint32_t heartAnimationStartedAt_ = 0, heartAnimationDuration_ = 0, lastHeartTouchAt_ = 0;
+  int paintedHeartAge_ = -1;
+  uint32_t paintedHeartDuration_ = 0;
   std::atomic<bool> controlsVisible_{true};
   std::atomic<uint8_t> panelButtonMask_{0};
   uint32_t controlsTouchedAt_ = 0;

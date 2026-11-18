@@ -655,6 +655,23 @@ void handleSerial() {
         diag["battery_percent"] = batteryPercent();
         diag["top_touch_ready"] = ui.topTouchReady();
         diag["top_wakes"] = ui.topWakes();
+        diag["heart_bursts"] = ui.heartBursts();
+        diag["heart_frames"] = ui.heartFrames();
+        diag["head_led"] = ui.headLedState();
+        diag["head_led_failures"] = ui.headLedFailures();
+        if (M5.getBoard() == m5::board_t::board_M5StackChan) {
+          auto& bus = M5.In_I2C;
+          uint8_t cfg, power[2], colors[14];
+          if (bus.readRegister(0x6f, 0x24, &cfg, 1, 100000)) diag["head_led_config"] = cfg;
+          if (bus.readRegister(0x6f, 0x30, colors, sizeof(colors), 100000)) {
+            diag["head_led_left_rgb565"] = colors[0] | (colors[1] << 8);
+            diag["head_led_right_rgb565"] = colors[12] | (colors[13] << 8);
+          }
+          if (bus.readRegister(0x58, 0x02, power, 2, 100000)) {
+            diag["head_led_bus_enabled"] = (power[0] & 0x02) != 0;
+            diag["head_led_boost_enabled"] = (power[1] & 0x80) != 0;
+          }
+        }
         diag["listening_wave_frames"] = ui.listeningWaveFrames();
         diag["listening_wave_height_px"] = ui.listeningWaveHeight();
         diag["speaking_wave_frames"] = ui.speakingWaveFrames();
@@ -818,7 +835,8 @@ void serviceStandby() {
   }
   // The top sensor's interrupt is unconnected. Keep RAM and poll the touch
   // controls between timed sleeps. A USB data host needs an awake controller.
-  if (!audioReady && head::standbySettled() && WiFi.getMode() == WIFI_OFF && !Serial.isPlugged()) {
+  if (!audioReady && head::standbySettled() && ui.headLedsIdle() &&
+      WiFi.getMode() == WIFI_OFF && !Serial.isPlugged()) {
     if (esp_sleep_enable_timer_wakeup(40000) == ESP_OK) {
       const int64_t started = esp_timer_get_time();
       const auto result = esp_light_sleep_start();
@@ -904,7 +922,7 @@ void setup() {
     return static_cast<int32_t>(echoUntil.load() - millis()) > 0 ?
         head::State::Speaking : head::State::Listening;
   });
-  Serial.println("STACKCHAN_READY v23");
+  Serial.println("STACKCHAN_READY v30");
 }
 
 void loop() {
