@@ -383,7 +383,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(TimeoutError):
                         await asyncio.wait_for(socket.recv(), .05)
                     self.assertFalse(handler.calls)
-                    await self.fake.send({"type": "session.input_transcript.delta", "delta": "Hoor je mij?"})
+                    phrase = "Hoor je mij?" if approved else "Ik had het net over Chatty."
+                    await self.fake.send({"type": "session.input_transcript.delta", "delta": phrase})
                     if approved:
                         self.assertEqual(await asyncio.wait_for(socket.recv(), 1), voiced)
                         await asyncio.wait_for(handler.started.wait(), 1)
@@ -391,7 +392,33 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         self.assertEqual((await self.event(socket))["reason"], "resume_rejected")
                         self.assertFalse(handler.calls)
-                    decision.assert_called_once_with(CONFIG.api_key, "Hoor je mij?", [])
+                    decision.assert_called_once_with(CONFIG.api_key, phrase, [])
+
+    async def test_soft_resume_with_chatty_prefix_releases_audio_and_tools_without_decisions(self):
+        handler = FakeHomeAssistant()
+        self.bridge.config = replace(CONFIG, tool_handler=handler)
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Voice-Resume": "1"}
+        with (patch("bridge.stackchan_bridge.VOICE_IDLE_SECONDS", .35),
+              patch("bridge.stackchan_bridge.addressed_to_stackchan", return_value=(False, None)) as decision):
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                await self.event(socket, "connected")
+                await self.start(socket)
+                self.assertEqual((await self.event(socket, "closed"))["reason"], "idle_timeout")
+                await socket.send('{"type":"resume"}')
+                await self.event(socket, "ready")
+                await self.fake.begin_response()
+                await self.fake.function_call()
+                await self.fake.complete_response()
+                voiced = b"\x01\x02" * (FRAME_BYTES // 2)
+                await self.fake.send({"type": "session.output_audio.delta", "delta": base64.b64encode(voiced).decode()})
+                await self.fake.send({"type": "session.input_transcript.delta", "delta": "Chatty"})
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(socket.recv(), .12)
+                self.assertFalse(handler.calls)
+                await self.fake.send({"type": "session.input_transcript.delta", "delta": ", hoor je mij?"})
+                self.assertEqual(await asyncio.wait_for(socket.recv(), .5), voiced)
+                await asyncio.wait_for(handler.started.wait(), .5)
+                decision.assert_not_called()
 
     async def test_negotiated_pcm_pairs_and_silence_preserve_the_audio_clock(self):
         headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Audio": "pcm-pair-v1"}

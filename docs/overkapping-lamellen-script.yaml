@@ -1,0 +1,17 @@
+stackchan_lamellen_stop:
+  alias: Lamellen overkapping open
+  description: >-
+    Gebruik dit script voor een uitdrukkelijk verzoek om de daklamellen van
+    de overkapping open te zetten of hun beweging te stoppen. Voorbeelden:
+    "Zet de lamellen van de overkapping open", "Zet de overkapping open",
+    "Zet de lamellen open" en "Stop de lamellen". Het script stuurt één
+    ESPSomfy Stop-commando naar de daklamellen. Gebruik het alleen voor
+    de daklamellen, en alleen bij een bedieningsopdracht.
+  sequence:
+    - action: espsomfy_rts.send_command
+      target:
+        entity_id: cover.espsomfyrts_daklamellen
+      data:
+        command: Stop
+        repeat: 1
+  mode: single

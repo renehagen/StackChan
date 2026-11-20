@@ -547,6 +547,35 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["options"]), 2)
         self.assertEqual([call["name"] for call in calls], ["GetLiveContext", "HassTurnOn", "GetLiveContext"])
 
+    async def test_configured_scene_activation_uses_script_instead_of_direct_scene(self):
+        for tool in self.fake.catalog[:2]:
+            tool["inputSchema"]["properties"].update(name={"type": "string"}, domain={"type": "array"},
+                                                     area={"type": "string"})
+        self.fake.catalog.append({"name": "digidot_dag", "description": "Digidot dag",
+                                  "inputSchema": {"type": "object", "properties": {}}})
+        title = "Daglicht woonkamer op donkere dagen"
+        client = HomeAssistantTools(self.path, scripts=("digidot_dag",), scene_scripts={
+            title: {"script": "digidot_dag", "area": "Woonkamer"},
+        })
+        client._opener = self.fake
+        await client.initialize()
+        self.assertEqual(client.scene_script_routes(), {title: "ha_script_digidot_dag"})
+        for tool, args in (
+            ("ha_ActivateScene", {"name": title + " scène"}),
+            ("ha_HassTurnOn", {"name": title, "domain": ["scene"], "area": "Woonkamer"}),
+        ):
+            result = await client.execute(tool, args)
+            self.assertTrue(result["ok"])
+            self.assertEqual((result["via_tool"], result["resolved_domain"]), ("ha_script_digidot_dag", "script"))
+        self.assertEqual(self.fake.calls, [{"name": "digidot_dag", "arguments": {}}] * 2)
+        wrong_area = await client.execute("ha_ActivateScene", {"name": title, "area": "Keuken"})
+        self.assertEqual(wrong_area["error"], "scene_script_area_mismatch")
+        self.fake.catalog.pop()
+        await client.initialize()
+        unavailable = await client.execute("ha_ActivateScene", {"name": title})
+        self.assertEqual(unavailable["error"], "scene_replacement_unavailable")
+        self.assertEqual(len(self.fake.calls), 2)
+
     async def test_unmatched_description_returns_scoped_candidates_without_dispatch(self):
         for tool in self.fake.catalog[:2]:
             tool["inputSchema"]["properties"].update(name={"type": "string"}, domain={"type": "array"})

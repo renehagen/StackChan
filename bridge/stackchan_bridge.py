@@ -42,12 +42,12 @@ if __package__:
     from .home_assistant import (ACTIVATE_SCENE_TOOL, ATOMS3_TOOL, CONTEXT_REFRESH_SECONDS,
                                  SET_AREA_DEVICES_TOOL, SET_LOCK_TOOL,
                                  HomeAssistantError, HomeAssistantTools, diagnostic_text)
-    from .wake_word import WakeListener, WhisperWake
+    from .wake_word import WAKE_PREFIX, WakeListener, WhisperWake
 else:
     from home_assistant import (ACTIVATE_SCENE_TOOL, ATOMS3_TOOL, CONTEXT_REFRESH_SECONDS,
                                 SET_AREA_DEVICES_TOOL, SET_LOCK_TOOL,
                                 HomeAssistantError, HomeAssistantTools, diagnostic_text)
-    from wake_word import WakeListener, WhisperWake
+    from wake_word import WAKE_PREFIX, WakeListener, WhisperWake
 
 
 UPSTREAM_URL = "wss://api.openai.com/v1/live/sessions"
@@ -394,6 +394,13 @@ class Config:
             })
         cached_targets = getattr(self.tool_handler, "cached_targets", lambda: [])()
         saved_aliases = getattr(self.tool_handler, "saved_aliases", lambda: [])()
+        scene_script_routes = getattr(self.tool_handler, "scene_script_routes", lambda: {})()
+        scene_script_context = (
+            "De volgende oude scènenamen zijn opdrachten voor het vermelde script. "
+            "Gebruik bij een herkenbare variant meteen ha_ActivateScene met de vermelde naam en eventueel "
+            "de gevraagde ruimte, zodat de bridge het juiste script uitvoert. "
+            + json.dumps(scene_script_routes, ensure_ascii=False, separators=(",", ":")) + " "
+        ) if scene_script_routes else ""
         inventory = getattr(self.tool_handler, "delegation_context", lambda: {})()
         inventory_context = (
             "\nHome Assistant-catalogus (JSON-gegevens). areas koppelt officiële ruimtenamen aan hun aliassen. "
@@ -503,6 +510,7 @@ class Config:
                             blind_control +
                             area_control +
                             lock_control +
+                            scene_script_context +
                             "Beantwoord zorgvuldig in het Nederlands. Houd je antwoord "
                             "geschikt om hardop uit te spreken. Gebruik web_search voor actuele feiten "
                             "en noem kort de bron. Gebruik uitsluitend de beschikbare Home Assistant-tools "
@@ -828,7 +836,7 @@ class LiveSession:
         if role == "user":
             now = time.monotonic()
             if not self.resume_confirmed.is_set():
-                self.resume_phrase = (self.resume_phrase + delta)[-RESUME_TURN_CHARS:]
+                self.resume_phrase = (self.resume_phrase + delta)[:RESUME_TURN_CHARS]
                 self.resume_delta_at = now
             if self.voice_wake_word:
                 if now - self.pause_delta_at >= RESUME_TRANSCRIPT_PAUSE:
@@ -845,16 +853,25 @@ class LiveSession:
     async def _screen_resumed_speech(self) -> None:
         deadline = time.monotonic() + RESUME_SCREEN_SECONDS
         while time.monotonic() < deadline and self.ready:
-            if self.resume_phrase.strip() and time.monotonic() - self.resume_delta_at >= RESUME_TRANSCRIPT_PAUSE:
-                self.resume_check = asyncio.create_task(self._check_resume(self.resume_phrase.strip()))
+            phrase = self.resume_phrase.strip()
+            settled = time.monotonic() - self.resume_delta_at >= RESUME_TRANSCRIPT_PAUSE
+            prefix = WAKE_PREFIX.match(phrase)
+            # A transcript fragment can end in the middle of a word.
+            if prefix and (prefix.end() < len(phrase) or settled):
+                accepted = True
+                log_diagnostic("voice_resume_wake_word", session=self.local_session, accepted=True)
+            elif phrase and settled:
+                self.resume_check = asyncio.create_task(self._check_resume(phrase))
                 accepted = await asyncio.shield(self.resume_check)
                 log_diagnostic("voice_resume_decision", session=self.local_session, accepted=accepted)
-                if accepted and self.ready:
-                    self.resume_confirmed.set()
-                    self._mark_voice_activity("resume_accepted")
-                    return
-                break
-            await asyncio.sleep(.1)
+            else:
+                await asyncio.sleep(.1)
+                continue
+            if accepted and self.ready:
+                self.resume_confirmed.set()
+                self._mark_voice_activity("resume_accepted")
+                return
+            break
         if self.ready:
             self.stop("resume_rejected")
 
@@ -1082,7 +1099,10 @@ class LiveSession:
             if name == "ha_SaveAlias":
                 fields["alias"] = diagnostic_text(target.get("alias"), 40)
                 fields["alias_target"] = diagnostic_text(target.get("target"), 80)
-            if name == ATOMS3_TOOL or isinstance(result, dict) and result.get("via_tool") == ATOMS3_TOOL:
+            via_tool = result.get("via_tool") if isinstance(result, dict) else None
+            if isinstance(via_tool, str) and via_tool in self.allowed_functions:
+                fields["via_tool"] = via_tool
+            if name == ATOMS3_TOOL or via_tool == ATOMS3_TOOL:
                 fields["via_tool"] = ATOMS3_TOOL
                 fields["effect"] = diagnostic_text(target.get("effect") or ("Solid" if target.get("color") else None), 32)
                 fields["color"] = diagnostic_text(target.get("color"), 32)
@@ -1833,7 +1853,7 @@ def load_environment(path: Path) -> dict[str, str]:
     """Read one explicit env file without evaluation, expansion, or logging."""
     values: dict[str, str] = {}
     allowed = {"OPENAI_API_KEY", "STACKCHAN_DEVICE_TOKEN", "STACKCHAN_BACKEND_MODEL", "STACKCHAN_VOICE",
-               "STACKCHAN_HA_SCRIPTS"}
+               "STACKCHAN_HA_SCRIPTS", "STACKCHAN_HA_SCENE_SCRIPTS"}
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -1874,8 +1894,12 @@ async def run_server(args: argparse.Namespace) -> None:
     if auth_path.exists():
         try:
             scripts = tuple(name.strip() for name in values.get("STACKCHAN_HA_SCRIPTS", "").split(",") if name.strip())
-            tool_handler = HomeAssistantTools(auth_path, scripts=scripts,
-                                              cache_path=auth_path.with_name("ha-target-cache.json"))
+            try:
+                scene_scripts = json.loads(values.get("STACKCHAN_HA_SCENE_SCRIPTS") or "{}")
+                tool_handler = HomeAssistantTools(auth_path, scripts=scripts, scene_scripts=scene_scripts,
+                                                  cache_path=auth_path.with_name("ha-target-cache.json"))
+            except ValueError:
+                raise HomeAssistantError("invalid_home_assistant_tool_config") from None
             await tool_handler.initialize()
             definitions = tool_handler.definitions()
             script_count = sum(tool["name"].startswith("ha_script_") for tool in definitions)

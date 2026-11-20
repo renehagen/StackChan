@@ -323,7 +323,7 @@ def _domains(value: Any) -> tuple[str, ...] | None:
 
 class HomeAssistantTools:
     def __init__(self, auth_path: Path, *, timeout: float = 8.0, scripts: tuple[str, ...] = (),
-                 cache_path: Path | None = None):
+                 cache_path: Path | None = None, scene_scripts: dict[str, dict[str, str]] | None = None):
         if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise HomeAssistantError("invalid_timeout")
         self._path = Path(auth_path)
@@ -332,6 +332,17 @@ class HomeAssistantTools:
         if any(not re.fullmatch(r"[a-z0-9_]{1,54}", name) for name in scripts):
             raise ValueError("Gebruik objectnamen zonder script. in STACKCHAN_HA_SCRIPTS")
         self._scripts = frozenset(scripts)
+        self._scene_scripts: dict[str, Target] = {}
+        if scene_scripts is not None:
+            if not isinstance(scene_scripts, dict):
+                raise ValueError("Ongeldige scènevervanging")
+            for label, route in scene_scripts.items():
+                if not _target_label(label) or not isinstance(route, dict) or set(route) != {"script", "area"}:
+                    raise ValueError("Ongeldige scènevervanging")
+                script, area = route["script"], _target_label(route["area"])
+                if not isinstance(script, str) or script not in self._scripts or not area:
+                    raise ValueError("Scènevervanging vereist een ingesteld script en een ruimte")
+                self._scene_scripts[name_key(label)] = Target((label,), "script", (area,), tool="ha_script_" + script)
         self._cache_path = cache_path
         self._cache_home = hashlib.sha256(self._auth["base_url"].encode()).hexdigest()
         self._cache_lock = asyncio.Lock()
@@ -553,6 +564,28 @@ class HomeAssistantTools:
 
     def definitions(self) -> list[dict[str, Any]]:
         return copy.deepcopy(list(self._tools.values()))
+
+    def scene_script_routes(self) -> dict[str, str]:
+        return {target.names[0]: target.tool for target in self._scene_scripts.values()
+                if target.tool and target.tool in self._tools}
+
+    async def _run_scene_script(self, label: str, area: str | None) -> dict[str, Any] | None:
+        route = self._scene_scripts.get(name_key(label))
+        if not route:
+            shortened = _lookup_without_suffix({"name": label, "domain": "scene"})
+            if shortened:
+                route = self._scene_scripts.get(name_key(shortened["name"]))
+        if not route:
+            return None
+        if area and name_key(area) != name_key(route.areas[0]):
+            return {"ok": False, "error": "scene_script_area_mismatch",
+                    "feedback": f"Deze opdracht hoort bij {route.areas[0]}."}
+        script = route.tool
+        if script is None or script not in self._tools or self._tools[script]["parameters"].get("required"):
+            return {"ok": False, "error": "scene_replacement_unavailable",
+                    "feedback": "Het Home Assistant-script voor deze scène is niet beschikbaar."}
+        return {**await self.execute(script, {}), "via_tool": script,
+                "resolved_name": script.removeprefix("ha_script_").replace("_", " "), "resolved_domain": "script"}
 
     def _script_targets(self) -> list[Target]:
         targets = []
@@ -964,14 +997,22 @@ class HomeAssistantTools:
             if name == ACTIVATE_SCENE_TOOL:
                 if not label or (arguments.get("area") is not None and not area) or set(arguments) - {"name", "area"}:
                     return {"ok": False, "error": "invalid_tool_arguments"}
+                if replacement := await self._run_scene_script(label, area):
+                    return replacement
                 target = await self.execute(FIND_TARGET_TOOL, {**arguments, "domain": "scene"})
                 if not target.get("ok"):
                     return target
+                if replacement := await self._run_scene_script(target["name"], area):
+                    return replacement
                 command = self._named_arguments("ha_HassTurnOn", {"name": target["name"]}, target)
                 result = await self.execute("ha_HassTurnOn", command, _resolve_name=False, _resolve_alias=False)
                 return {**result, "resolved_name": target["name"], "resolved_domain": "scene"}
             domains = _domains(arguments.get("domain"))
             valid_scope = domains is not None and (arguments.get("area") is None or bool(area))
+            scene_activation = (name == "ha_HassTurnOn" and label and valid_scope and domains in ((), ("scene",))
+                                and not (set(arguments) - {"name", "area", "domain"}))
+            if scene_activation and (replacement := await self._run_scene_script(label, area)):
+                return replacement
             alias = self._aliases.get(_alias_key(label)) if _resolve_alias and not name.startswith("ha_script_") else None
             if name == FIND_TARGET_TOOL:
                 if not label or not valid_scope or set(arguments) - {"name", "area", "domain"}:
@@ -996,6 +1037,9 @@ class HomeAssistantTools:
                 if candidate.get("error") == "target_ambiguous":
                     return candidate
                 if candidate.get("ok"):
+                    if scene_activation and candidate["domain"] == "scene":
+                        if replacement := await self._run_scene_script(candidate["name"], area):
+                            return replacement
                     color_args = self._atoms3_color_arguments(name, arguments, candidate)
                     if color_args is not None:
                         return {**await self.execute(ATOMS3_TOOL, color_args), "via_tool": ATOMS3_TOOL,
