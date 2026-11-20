@@ -28,6 +28,14 @@ struct UiSnapshot {
   bool mutePending = false;
   bool starting = false;
   bool closing = false;
+  bool voiceWaiting = false;
+  bool wakeWordWaiting = false;
+  bool voiceCostVisible = false;
+  uint32_t voiceCostCents = 0;
+  bool voiceTotalCostVisible = false;
+  uint32_t voiceTotalCostCents = 0;
+  bool toolTotalCostVisible = false;
+  uint32_t toolTotalCostCents = 0;
   bool connected = false;
   bool wifiConnected = false;
   int8_t batteryPercent = -1;
@@ -71,6 +79,7 @@ class DeviceUi {
   const char* headLedState() const;
   uint32_t headLedFailures() const { return headLedFailures_.load(std::memory_order_relaxed); }
   uint8_t panelButtonMask() const { return panelButtonMask_.load(); }
+  int wakeBannerPosition() const { return wakeBannerPosition_.load(std::memory_order_relaxed); }
   bool ready() const { return ready_.load(std::memory_order_acquire); }
   uint32_t maxRenderMs() const {
     return maxRenderMs_.load(std::memory_order_relaxed);
@@ -90,7 +99,7 @@ class DeviceUi {
   void releaseBeforeTask();
 
   enum class WaveMode : uint8_t { Idle, Listening, Speaking, Muted };
-  enum class HeadLedMode : uint8_t { Unknown, Off, Green, Orange, Pulse };
+  enum class HeadLedMode : uint8_t { Unknown, Off, Green, Orange, DimOrange, RedPulse, GreenPulse };
   struct HeadLedRequest {
     HeadLedMode mode;
     uint32_t startedAt, duration;
@@ -106,6 +115,8 @@ class DeviceUi {
   uint32_t waveSampleAt_ = 0;
   uint32_t waveWindowPeak_ = 0;
   std::atomic<int> paintedWaveHeight_{0};
+  std::atomic<int> wakeBannerPosition_{-1};
+  uint32_t wakeBannerStartedAt_ = 0;
   int speechLevel_ = 0;
   uint32_t speechUpdatedAt_ = 0;
   int paintedSpeechUnit_ = 0, paintedSpeechPairs_ = 0;
@@ -130,6 +141,7 @@ class DeviceUi {
   std::atomic<HeadLedMode> headLedMode_{HeadLedMode::Unknown};
   std::atomic<uint32_t> headLedFailures_{0};
   uint16_t headLedColor_ = 0;
+  uint8_t headLedBrighterPixels_ = 0;
   uint32_t headLedRetryAt_ = 0;
   bool headLedsConfigured_ = false;
   bool headLedOwnsBusPower_ = false, headLedOwnsBoost_ = false;

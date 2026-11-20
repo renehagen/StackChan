@@ -15,7 +15,7 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from bridge.stackchan_bridge import Config, FRAME_BYTES, LiveBridge, LiveSession, load_environment
+from bridge.stackchan_bridge import Config, FRAME_BYTES, LiveBridge, LiveSession, VoiceLedger, load_environment, token_usage_cost
 
 
 TOKEN = "test-device-token-for-local-tests-only"
@@ -61,6 +61,7 @@ class FakeOpenAI:
         self.release_start.set()
         self.started = asyncio.Event()
         self.finalize = True
+        self.final_seconds = 2.5
         self.received_at = []
 
     async def send(self, event):
@@ -86,7 +87,7 @@ class FakeOpenAI:
                 await self.send({"type": "session.started", "session": {"id": "local-test"}})
                 self.started.set()
             elif event["type"] == "session.close" and self.finalize:
-                await self.send({"type": "session.closed", "usage": {"seconds": 2.5}})
+                await self.send({"type": "session.closed", "usage": {"seconds": self.final_seconds}})
             elif event["type"] == "session.input_audio.mute":
                 await self.send({"type": "session.input_audio.muted"})
             elif event["type"] == "session.input_audio.unmute":
@@ -171,7 +172,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.fake.release_start.clear()
         await socket.send('{"type":"start"}')
         start = await self.fake.next("session.start")
-        self.assertEqual(start["session"]["model"], "gpt-live-1")
+        self.assertEqual(start["session"]["model"], "gpt-live-1.1")
         self.assertEqual(start["session"]["audio"]["format"], {"type": "audio/pcm", "rate": 16000})
         self.assertEqual(start["session"]["delegation"]["type"], "responses")
         self.assertEqual(self.fake.authorization, f"Bearer {CONFIG.api_key}")
@@ -197,6 +198,200 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         event = await self.stop(socket)
         self.assertTrue(event["usage_confirmed"])
         self.assertEqual(event["usage_seconds"], 2.5)
+
+    async def test_voice_idle_closes_and_resume_seeds_recent_dialogue(self):
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Voice-Resume": "1"}
+        with patch("bridge.stackchan_bridge.VOICE_IDLE_SECONDS", .20):
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                self.assertTrue((await self.event(socket))["voice_resume"])
+                await self.start(socket)
+                original = await self.fake.next("session.start")
+                self.assertNotIn("input", original["session"])
+                await self.fake.send({"type": "session.input_transcript.delta", "delta": "Een vraag."})
+                await asyncio.sleep(.12)
+                await self.fake.send({"type": "session.output_transcript.delta", "delta": "Een antwoord."})
+                await socket.send(bytes(FRAME_BYTES))
+                await self.fake.next("session.input_audio.append")
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(socket.recv(), .10)
+                closed = await self.event(socket, "closed")
+                self.assertEqual(closed["reason"], "idle_timeout")
+                self.assertTrue(closed["usage_confirmed"])
+                await socket.send('{"type":"resume"}')
+                resumed = await self.fake.next("session.start")
+                self.assertEqual(resumed["session"]["input"], [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Een vraag."}]},
+                    {"type": "message", "role": "assistant", "content": [
+                        {"type": "output_text", "text": "Een antwoord."},
+                    ]},
+                ])
+                self.assertEqual((await self.event(socket, "ready"))["rate"], 16000)
+                self.assertEqual((await self.event(socket, "closed"))["reason"], "idle_timeout")
+                await socket.send('{"type":"cancel_resume"}')
+                await socket.send('{"type":"resume"}')
+                self.assertEqual((await self.event(socket, "error"))["code"], "not_ready")
+
+    async def test_voice_cost_uses_live_usage_and_accumulates_only_until_new_start(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "cost.sqlite3"
+        log = path.with_suffix(".log")
+        entry = {"event": "session_closed", "session": "12ab34cd5678", "usage_seconds": 60, "usage_confirmed": True}
+        log.write_text(("2026-11-20T09:00:00+0100 " + json.dumps(entry) + "\n") * 2)
+        self.bridge.voice_ledger = VoiceLedger(path, log)
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Voice-Resume": "1", "X-StackChan-Voice-Cost": "1"}
+        with patch("bridge.stackchan_bridge.VOICE_IDLE_SECONDS", 1.35):
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                hello = await self.event(socket)
+                self.assertTrue(hello["voice_cost"])
+                self.assertEqual(hello["voice_total_cost_cents"], 5)
+                self.fake.final_seconds = 90
+                await socket.send('{"type":"start"}')
+                self.assertEqual((await self.event(socket, "ready"))["voice_cost_cents"], 0)
+                await self.fake.send({"type": "session.usage.updated", "usage": {"seconds": 120}})
+                await self.fake.send({"type": "session.usage.updated", "usage": {"seconds": 60}})
+                async with asyncio.timeout(2):
+                    live = json.loads(await socket.recv())
+                self.assertEqual(live, {"type": "voice_cost", "voice_cost_cents": 10,
+                                        "voice_total_cost_cents": 15, "tool_total_cost_cents": 0})
+                first = await self.event(socket, "closed")
+                self.assertEqual((first["reason"], first["voice_cost_cents"]), ("idle_timeout", 8))
+                self.assertEqual(first["voice_total_cost_cents"], 13)
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(socket.recv(), .08)
+                self.fake.final_seconds = 510
+                await socket.send('{"type":"resume"}')
+                resumed = await self.event(socket, "ready")
+                self.assertEqual((resumed["voice_cost_cents"], resumed["voice_total_cost_cents"]), (8, 13))
+                await socket.send('{"type":"stop"}')
+                second = await self.event(socket, "closed")
+                self.assertEqual((second["voice_cost_cents"], second["voice_total_cost_cents"]), (50, 55))
+                self.fake.final_seconds = 60
+                await socket.send('{"type":"start"}')
+                self.assertEqual((await self.event(socket, "ready"))["voice_cost_cents"], 0)
+                await socket.send('{"type":"stop"}')
+                third = await self.event(socket, "closed")
+                self.assertEqual((third["voice_cost_cents"], third["voice_total_cost_cents"]), (5, 60))
+        self.assertEqual(VoiceLedger(path, log).total, 600_000)
+
+    async def test_tool_cost_records_each_billable_request_once_and_keeps_rejected_decisions(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "cost.sqlite3"
+        self.bridge.voice_ledger = VoiceLedger(path)
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Voice-Resume": "1", "X-StackChan-Voice-Cost": "1"}
+        with (patch("bridge.stackchan_bridge.VOICE_IDLE_SECONDS", .25),
+              patch("bridge.stackchan_bridge.RESUME_TRANSCRIPT_PAUSE", .01),
+              patch("bridge.stackchan_bridge.addressed_to_stackchan", return_value=(False, 2_000_000))):
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                self.assertEqual((await self.event(socket, "connected"))["tool_total_cost_cents"], 0)
+                await self.start(socket)
+                await self.fake.begin_response()
+                for _ in range(2):
+                    await self.fake.complete_response(
+                        model="gpt-5.6-luna", service_tier="default",
+                        usage={"input_tokens": 10000, "input_tokens_details": {
+                            "cached_tokens": 2000, "cache_write_tokens": 4000}, "output_tokens": 1000},
+                        tool_usage={"web_search": {"num_requests": 2}},
+                    )
+                closed = await self.event(socket, "closed")
+                self.assertEqual(closed["tool_total_cost_cents"], 2)
+                await socket.send('{"type":"resume"}')
+                self.assertEqual((await self.event(socket, "ready"))["tool_total_cost_cents"], 2)
+                await self.fake.send({"type": "session.input_transcript.delta", "delta": "Achtergrondspraak"})
+                closed = await self.event(socket, "closed")
+                self.assertEqual((closed["reason"], closed["tool_total_cost_cents"]), ("resume_rejected", 3))
+        self.assertEqual(VoiceLedger(path).tools_total, 25_040_000)
+
+    def test_decisions_token_cost_uses_input_only_and_separate_cache_rates(self):
+        usage = {"input_tokens": 5000, "input_tokens_details": {"cached_tokens": 1500, "cache_write_tokens": 2000},
+                 "output_tokens": 9999}
+        self.assertEqual(token_usage_cost("gpt-6-luna", usage, decisions=True), 415_000)
+        self.assertIsNone(token_usage_cost("unknown-model", usage))
+
+    async def test_voice_idle_waits_for_home_assistant_work(self):
+        handler = FakeHomeAssistant()
+        handler.gate = asyncio.Event()
+        self.bridge.config = replace(CONFIG, tool_handler=handler, tool_timeout=2)
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Voice-Resume": "1"}
+        with patch("bridge.stackchan_bridge.VOICE_IDLE_SECONDS", .15):
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                await self.event(socket, "connected")
+                await self.start(socket)
+                await self.fake.begin_response()
+                await self.fake.function_call()
+                await self.fake.complete_response()
+                await asyncio.wait_for(handler.started.wait(), 1)
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(socket.recv(), .35)
+                handler.gate.set()
+                await self.fake.next("response.item.create")
+                await self.fake.next("response.create")
+                self.assertEqual((await self.event(socket, "closed"))["reason"], "idle_timeout")
+
+    async def test_voice_idle_ignores_noise_and_unfinished_backend_response(self):
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Voice-Resume": "1"}
+        noisy_pcm = b"\xd0\x07" * (FRAME_BYTES // 2)
+        noise_delta = {"type": "session.output_audio.delta", "delta": base64.b64encode(noisy_pcm).decode()}
+        with patch("bridge.stackchan_bridge.VOICE_IDLE_SECONDS", .20):
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                await self.event(socket, "connected")
+                await self.start(socket)
+                await self.fake.begin_response()
+
+                async def feed_noise():
+                    while True:
+                        await socket.send('{"type":"voice_activity"}')
+                        await socket.send(noisy_pcm)
+                        if self.fake.socket.state.name == "OPEN":
+                            try:
+                                await self.fake.send(noise_delta)
+                                await self.fake.send({"type": "session.input_transcript.delta", "delta": "achtergrond"})
+                            except ConnectionClosed:
+                                pass
+                        await asyncio.sleep(.02)
+
+                feeder = asyncio.create_task(feed_noise())
+                try:
+                    async with asyncio.timeout(.8):
+                        while isinstance(raw := await socket.recv(), bytes):
+                            self.assertEqual(raw, noisy_pcm)
+                    self.assertEqual(json.loads(raw)["reason"], "idle_timeout")
+                finally:
+                    feeder.cancel()
+                    await asyncio.gather(feeder, return_exceptions=True)
+
+    async def test_speech_resume_blocks_audio_and_tools_until_decisions_approves(self):
+        handler = FakeHomeAssistant()
+        self.bridge.config = replace(CONFIG, tool_handler=handler)
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Voice-Resume": "1"}
+        for approved in (False, True):
+            with (patch("bridge.stackchan_bridge.VOICE_IDLE_SECONDS", .20),
+                  patch("bridge.stackchan_bridge.RESUME_TRANSCRIPT_PAUSE", .01),
+                  patch("bridge.stackchan_bridge.addressed_to_stackchan", return_value=(approved, None)) as decision):
+                async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                    await self.event(socket, "connected")
+                    await self.start(socket)
+                    self.assertEqual((await self.event(socket, "closed"))["reason"], "idle_timeout")
+                    await socket.send('{"type":"resume"}')
+                    await self.event(socket, "ready")
+                    await self.fake.begin_response()
+                    await self.fake.function_call()
+                    await self.fake.complete_response()
+                    voiced = b"\x01\x02" * (FRAME_BYTES // 2)
+                    await self.fake.send({"type": "session.output_audio.delta", "delta": base64.b64encode(voiced).decode()})
+                    with self.assertRaises(TimeoutError):
+                        await asyncio.wait_for(socket.recv(), .05)
+                    self.assertFalse(handler.calls)
+                    await self.fake.send({"type": "session.input_transcript.delta", "delta": "Hoor je mij?"})
+                    if approved:
+                        self.assertEqual(await asyncio.wait_for(socket.recv(), 1), voiced)
+                        await asyncio.wait_for(handler.started.wait(), 1)
+                        self.assertEqual(len(handler.calls), 1)
+                    else:
+                        self.assertEqual((await self.event(socket))["reason"], "resume_rejected")
+                        self.assertFalse(handler.calls)
+                    decision.assert_called_once_with(CONFIG.api_key, "Hoor je mij?", [])
 
     async def test_negotiated_pcm_pairs_and_silence_preserve_the_audio_clock(self):
         headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Audio": "pcm-pair-v1"}
@@ -354,6 +549,116 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed["reason"], "user_stop")
         self.assertTrue(closed["usage_confirmed"])
         await socket.close()
+
+    async def test_wake_word_pause_closes_live_and_only_local_keyword_resume_bypasses_decisions(self):
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Controls": "voice-v1",
+                   "X-StackChan-Voice-Resume": "1", "X-StackChan-Wake-Word": "1"}
+        with patch("bridge.stackchan_bridge.addressed_to_stackchan") as decision:
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                self.assertTrue((await self.event(socket, "connected"))["wake_word"])
+                await self.start(socket)
+                event = await self.fake.next("session.start")
+                self.assertIn("pauzeer gesprek", event["session"]["instructions"])
+                await self.fake.send({"type": "session.input_transcript.delta", "delta": "Een vraag"})
+                await self.fake.begin_response()
+                await self.fake.function_call(name="stackchan_control", arguments='{"action":"pause_for_wake_word"}')
+                await self.fake.complete_response()
+                command = await self.event(socket, "voice_control")
+                self.assertEqual(command["action"], "pause_for_wake_word")
+                await socket.send(json.dumps({"type": "voice_control_ack", "id": command["id"], "ok": True}))
+                await self.fake.next("session.close")
+                closed = await self.event(socket, "closed")
+                self.assertEqual(closed["reason"], "wake_word_pause")
+                await socket.send('{"type":"resume"}')
+                self.assertEqual((await self.event(socket, "error"))["code"], "not_ready")
+                self.assertEqual(self.fake.connections, 1)
+                await socket.send('{"type":"resume_wake_word"}')
+                resumed = await self.fake.next("session.start")
+                self.assertEqual(resumed["session"]["input"][0]["content"][0]["text"], "Een vraag")
+                await self.event(socket, "ready")
+                voiced = b"\x01\x02" * (FRAME_BYTES // 2)
+                await self.fake.send({"type": "session.output_audio.delta", "delta": base64.b64encode(voiced).decode()})
+                self.assertEqual(await asyncio.wait_for(socket.recv(), 1), voiced)
+                decision.assert_not_called()
+                await self.stop(socket)
+
+    async def test_bridge_wake_only_opens_live_after_local_match_and_replays_pcm(self):
+        checks = []
+
+        def recognize(pcm):
+            checks.append(pcm)
+            return len(checks) == 2
+
+        self.bridge.wake_recognizer = recognize
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Audio": "pcm-pair-v1",
+                   "X-StackChan-Controls": "voice-v1", "X-StackChan-Voice-Resume": "1",
+                   "X-StackChan-Wake-Word": "bridge-v1"}
+        sound = b"\x01\x02" * (FRAME_BYTES // 2)
+        silence = bytes(FRAME_BYTES)
+        with patch("bridge.stackchan_bridge.addressed_to_stackchan") as decision:
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                self.assertTrue((await self.event(socket, "connected"))["wake_word"])
+                await socket.send('{"type":"wake_word_wait"}')
+                await socket.send('{"type":"resume_wake_word"}')
+                self.assertEqual((await self.event(socket, "error"))["code"], "not_ready")
+                for _ in range(2):
+                    for _ in range(10):
+                        await socket.send(sound)
+                    for _ in range(16):
+                        await socket.send(silence)
+                    if not checks:
+                        with self.assertRaises(TimeoutError):
+                            await asyncio.wait_for(socket.recv(), .12)
+                        self.assertEqual(self.fake.connections, 0)
+                await self.event(socket, "wake_word_detected")
+                self.assertEqual(self.fake.connections, 0)
+                await socket.send('{"type":"resume_wake_word"}')
+                await self.event(socket, "ready")
+                replay = [await self.fake.next("session.input_audio.append") for _ in range(14)]
+                self.assertIn(sound, [base64.b64decode(event["audio"]) for event in replay])
+                self.assertEqual(len(checks), 2)
+                decision.assert_not_called()
+                await self.stop(socket)
+
+    async def test_pause_transcripts_work_after_repeated_wake_without_tool_calls(self):
+        self.bridge.wake_recognizer = lambda pcm: True
+        headers = {"Authorization": f"Bearer {TOKEN}", "X-StackChan-Audio": "pcm-pair-v1",
+                   "X-StackChan-Controls": "voice-v1", "X-StackChan-Voice-Resume": "1",
+                   "X-StackChan-Wake-Word": "bridge-v1"}
+        with patch("bridge.stackchan_bridge.RESUME_TRANSCRIPT_PAUSE", .05), \
+                patch("bridge.stackchan_bridge.addressed_to_stackchan") as decision:
+            async with connect(self.url, additional_headers=headers, proxy=None) as socket:
+                self.assertTrue((await self.event(socket, "connected"))["wake_word"])
+                await self.start(socket)
+                for phrase in ("Wacht op wake word betekent pauzeren.", "Oké, pauzeer het gesprek niet.",
+                               "Hallo, wat betekent pauzeer het gesprek?"):
+                    await self.fake.send({"type": "session.input_transcript.delta", "delta": phrase})
+                    with self.assertRaises(TimeoutError):
+                        await asyncio.wait_for(socket.recv(), .32)
+
+                for index, fragments in enumerate((
+                    ("Wacht op", " wake word."),
+                    ("Oké, ", "pauzeer het ", "gesprek."),
+                    ("Hallo,", " pauzeer ", "het gesprek."),
+                    ("Hi Chatty, ", "wacht op het wekwoord."),
+                    ("Hoi Chatty, kun je ", "het gesprek even pauzeren?"),
+                )):
+                    for delta in fragments:
+                        await self.fake.send({"type": "session.input_transcript.delta", "delta": delta})
+                    command = await self.event(socket, "voice_control")
+                    self.assertEqual(command["action"], "pause_for_wake_word")
+                    await socket.send(json.dumps({"type": "voice_control_ack", "id": command["id"], "ok": True}))
+                    self.assertEqual((await self.event(socket, "closed"))["reason"], "wake_word_pause")
+                    self.assertEqual(self.fake.connections, index + 1)
+                    for _ in range(10):
+                        await socket.send(b"\x01\x02" * (FRAME_BYTES // 2))
+                    for _ in range(16):
+                        await socket.send(bytes(FRAME_BYTES))
+                    await self.event(socket, "wake_word_detected")
+                    await socket.send('{"type":"resume_wake_word"}')
+                    await self.event(socket, "ready")
+                decision.assert_not_called()
+                await self.stop(socket)
 
     async def test_voice_alignment_opens_only_supported_devices_and_closes_after_ack(self):
         socket = await connect(self.url, additional_headers={
@@ -701,6 +1006,38 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(continuation), {"type", "event_id"})
         self.assertNotEqual(result["event_id"], continuation["event_id"])
         await self.stop(socket)
+
+    async def test_curtain_commands_only_use_configured_scene_aliases(self):
+        class Curtains(FakeHomeAssistant):
+            def definitions(self):
+                return [{"name": "ha_ActivateScene", "type": "function", "parameters": {"type": "object"}}]
+
+            def saved_aliases(self):
+                return [
+                    {"alias": "gordijnen dicht", "name": "Blinds closed", "area": None, "domain": "scene"},
+                    {"alias": "gordijnen open", "name": "Curtain Left", "area": None, "domain": "light"},
+                ]
+
+        session = replace(CONFIG, tool_handler=Curtains()).start_event()["session"]
+        self.assertIn("Delegeer opdrachten om de gordijnen", session["instructions"])
+        policy = session["delegation"]["responses"]["instructions"]
+        self.assertIn("roep je direct ha_ActivateScene", policy)
+        self.assertIn("sluit de gordijnen", policy)
+        self.assertIn("name ‘gordijnen dicht’", policy)
+        self.assertNotIn("name ‘gordijnen open’", policy)
+        self.assertNotIn("Delegeer opdrachten om de gordijnen", CONFIG.start_event()["session"]["instructions"])
+
+    async def test_home_catalogue_is_sent_to_responses_only(self):
+        class Inventory(FakeHomeAssistant):
+            def delegation_context(self):
+                return {"areas": {"Keuken": ["Kookhoek"]},
+                        "entities": {"light": [["Eettafel", ["Keuken"], []]]}}
+
+        session = replace(CONFIG, tool_handler=Inventory()).start_event()["session"]
+        responses = session["delegation"]["responses"]["instructions"]
+        self.assertIn('{"areas":{"Keuken":["Kookhoek"]},"entities":{"light":[["Eettafel",["Keuken"],[]]]}}',
+                      responses)
+        self.assertNotIn("Kookhoek", session["instructions"])
 
     async def test_uncorrelated_response_events_use_unambiguous_response_identity(self):
         handler = FakeHomeAssistant()

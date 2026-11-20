@@ -34,7 +34,7 @@ async def check():
                             return 1
                         if event.get('type') == 'session.started':
                             started = True
-                            print('Live API: session.started received for gpt-live-1.')
+                            print(f'Live API: session.started received for {config.model}.')
                             for _ in range(10):
                                 await socket.send(json.dumps({'type': 'session.input_audio.append',
                                     'audio': base64.b64encode(bytes(640)).decode('ascii')}))

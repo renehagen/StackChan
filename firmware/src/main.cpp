@@ -11,6 +11,7 @@
 #include "DeviceUi.h"
 #include "HeadMotion.h"
 #include "VoiceTest.h"
+#include "VoiceGate.h"
 #include <esp_heap_caps.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
@@ -48,6 +49,8 @@ EventGroupHandle_t audioGate;
 constexpr EventBits_t kAudioRun = BIT0, kCaptureParked = BIT1, kPlaybackParked = BIT2;
 constexpr EventBits_t kAudioParked = kCaptureParked | kPlaybackParked;
 constexpr unsigned kCaptureFrames = 240, kPlaybackFrames = 200;
+constexpr unsigned kVoicePrerollFrames = 38;
+constexpr uint32_t kVoiceResumeTimeoutMs = 3800;
 StaticQueue_t captureControl{}, playbackControl{};
 bool pairedPcm = false;
 constexpr unsigned kFastPrebufferFrames = 60, kMediumPrebufferFrames = 65, kSafePrebufferFrames = 105;
@@ -61,6 +64,20 @@ uint32_t testResumeAt = 0;
 uint32_t testTxResumeAt = 0;
 bool testTxStallUsed = false;
 std::atomic<bool> active{false}, locallyMuted{false};
+std::atomic<bool> voiceWaiting{false}, voiceTriggered{false};
+std::atomic<bool> wakeWordWaiting{false};
+std::atomic<bool> waitForWakeQuiet{false};
+std::atomic<uint32_t> lastVoiceMs{0}, voiceWakeCount{0}, voiceWakeBuffered{0};
+std::atomic<int> voiceGateLevel{0}, voiceGateThreshold{0};
+bool bridgeVoiceResume = false;
+bool bridgeVoiceCost = false, voiceCostVisible = false;
+bool bridgeWakeWord = false;
+uint32_t voiceCostCents = 0;
+bool voiceTotalCostVisible = false;
+uint32_t voiceTotalCostCents = 0;
+bool toolTotalCostVisible = false;
+uint32_t toolTotalCostCents = 0;
+uint32_t lastVoiceReport = 0;
 std::atomic<bool> localInputHold{false}, localOutputHold{false};
 enum AudioFault : uint32_t { RxStall = 1, TxFailure = 2 };
 std::atomic<uint32_t> audioFaults{0};
@@ -173,6 +190,9 @@ bool waitForAudio(EventBits_t parked) {
 // Workers use I2S only while kAudioRun is set. Shutdown waits for both workers.
 void captureTask(void*) {
   uint32_t lastSample = millis();
+  VoiceGate gate;
+  bool previousWaiting = false;
+  unsigned wakeQuietFrames = 0;
   for (;;) {
     if (waitForAudio(kCaptureParked)) lastSample = millis();
     AudioFrame frame;
@@ -189,17 +209,57 @@ void captureTask(void*) {
       rxSamples.fetch_add(n);
       frame.count += n;
     }
-    if (frame.count != kAudioSamples || !active.load()) continue;
+    if (frame.count != kAudioSamples) continue;
+    const bool waiting = voiceWaiting.load();
+    const bool live = active.load();
+    const bool strict = waiting && wakeWordWaiting.load();
+    if (waiting != previousWaiting || (!waiting && !live)) {
+      gate.resetWindow();
+      wakeQuietFrames = 0;
+    }
+    previousWaiting = waiting;
+    if (!waiting && !live) continue;
     frame.capturedMs = millis();
     const bool echoGuard = static_cast<int32_t>(echoUntil.load() - millis()) > 0;
     if (voiceTest::enabled()) voiceTest::measureMic(frame, echoGuard);
     // Continuous, paced silence preserves the Live audio clock while muted.
-    if (locallyMuted.load() || localInputHold.load() || echoGuard) {
+    const bool inputBlocked = locallyMuted.load() || localInputHold.load() || echoGuard;
+    if (waiting && !live && inputBlocked) {
+      gate.resetWindow();
+      wakeQuietFrames = 0;
+      continue;
+    }
+    if (inputBlocked) {
+      gate.resetWindow();
       memset(frame.samples, 0, sizeof(frame.samples));
     } else {
+      const bool speech = gate.observe(frame, waiting);
+      if (!strict && waiting && waitForWakeQuiet.load()) {
+        wakeQuietFrames = gate.level() < gate.threshold() ? wakeQuietFrames + 1 : 0;
+        if (wakeQuietFrames >= 60) {
+          waitForWakeQuiet = false;
+          gate.resetWindow();
+        }
+      } else if (!strict && speech) {
+        if (live) lastVoiceMs = frame.capturedMs;
+        else if (voiceWaiting.load()) voiceTriggered = true;
+      }
+      voiceGateLevel = gate.level();
+      voiceGateThreshold = gate.threshold();
       uint32_t magnitude = 0;
       for (int16_t sample : frame.samples) magnitude += abs(static_cast<int32_t>(sample));
       ui.observeMic(magnitude / frame.count);
+    }
+    if (waiting && !live) {
+      if (!voiceWaiting.load()) continue;
+      const unsigned retain = strict ? 40 : kVoicePrerollFrames;
+      while (!voiceTriggered.load() && uxQueueMessagesWaiting(captureQueue) >= retain) {
+        AudioFrame stale;
+        xQueueReceive(captureQueue, &stale, 0);
+      }
+      // During connection setup preserve the opening words if the buffer fills.
+      xQueueSend(captureQueue, &frame, 0);
+      continue;
     }
     if (xQueueSend(captureQueue, &frame, 0) != pdTRUE) {
       AudioFrame stale;
@@ -264,7 +324,8 @@ void playbackTask(void*) {
     if (audible) ui.observeSpeaker(level);
     // The fixture is acoustic input. Let the real mic hear it. Ordinary
     // assistant playback still receives the existing echo guard above.
-    if (active.load() && !localOutputHold.load() && voiceTest::enabled()) {
+    if ((active.load() || (voiceWaiting.load() && wakeWordWaiting.load())) &&
+        !localOutputHold.load() && voiceTest::enabled()) {
       if (level > 180) voiceTest::markVoicedReply();
       else voiceTest::playPrompt(frame);
     }
@@ -276,11 +337,17 @@ void playbackTask(void*) {
   }
 }
 
-void clearAudio() {
+void clearAudio(bool keepCapture = false) {
   active = false;
   echoUntil = 0;
   displaySpeechUntil = 0;
-  if (captureQueue) xQueueReset(captureQueue);
+  if (!keepCapture) {
+    voiceWaiting = false;
+    wakeWordWaiting = false;
+    voiceTriggered = false;
+    waitForWakeQuiet = false;
+    if (captureQueue) xQueueReset(captureQueue);
+  }
   if (playbackQueue) xQueueReset(playbackQueue);
 }
 
@@ -323,6 +390,14 @@ void setDeviceVolume(int percent) {
 }
 
 bool requestMute(bool muted) {
+  if (voiceWaiting.load() && !starting && !closing) {
+    localInputHold = true;
+    voiceTriggered = false;
+    xQueueReset(captureQueue);
+    locallyMuted = muted;
+    localInputHold = muted;
+    return true;
+  }
   if (!active.load() || closing) return false;
   if (mutePending) return requestedMuteState == muted;
   if (locallyMuted.load() == muted) return true;
@@ -359,6 +434,11 @@ void handleVoiceControl(const JsonDocument& doc) {
       localInputHold = localOutputHold = true;
       stopConversation("Gesprek stoppen...", "user_stop", false);
       accepted = true;
+    } else if (action == "pause_for_wake_word" && bridgeWakeWord) {
+      localInputHold = localOutputHold = true;
+      stopConversation("Wacht op wake word", "wake_word_pause", false);
+      wakeWordWaiting = true;
+      accepted = true;
     } else if (action == "volume" && doc["percent"].is<int>()) {
       const int percent = doc["percent"].as<int>();
       if (percent >= 0 && percent <= 100) {
@@ -388,14 +468,23 @@ void onSocket(WStype_t event, uint8_t* data, size_t length) {
       status = (lastStop == "audio_send_failed" || lastStop == "bridge_error" || lastStop == "wifi_lost")
           ? "Verbinding hersteld - tik Start" : "Tik op Start";
       break;
-    case WStype_DISCONNECTED:
+    case WStype_DISCONNECTED: {
+      const bool strict = wakeWordWaiting.load();
       voiceTest::stop();
       if (active.load() || starting) lastStop = WiFi.status() == WL_CONNECTED ? "bridge_error" : "wifi_lost";
       connected = false;
+      bridgeVoiceResume = false;
+      bridgeVoiceCost = false;
+      bridgeWakeWord = false;
       starting = closing = mutePending = false;
       clearAudio();
-      status = "Bridge niet verbonden";
+      if (strict) {
+        wakeWordWaiting = voiceWaiting = true;
+        localInputHold = locallyMuted.load();
+        status = "Wacht op wake word";
+      } else status = "Bridge niet verbonden";
       break;
+    }
     case WStype_BIN: {
       if (!active.load()) break;
       const size_t blockBytes = sizeof(AudioFrame::samples);
@@ -426,15 +515,35 @@ void onSocket(WStype_t event, uint8_t* data, size_t length) {
       JsonDocument doc;
       if (deserializeJson(doc, data, length)) { protocolFault = true; break; }
       const String type = doc["type"] | "";
+      if (bridgeVoiceCost && voiceCostVisible &&
+          (type == "voice_cost" || type == "ready" || type == "closed") &&
+          doc["voice_cost_cents"].is<uint32_t>()) {
+        voiceCostCents = doc["voice_cost_cents"].as<uint32_t>();
+      }
+      if (type == "connected" || type == "ready" || type == "voice_cost" || type == "closed") {
+        if (type == "connected") voiceTotalCostVisible = toolTotalCostVisible = false;
+        if (doc["voice_total_cost_cents"].is<uint32_t>()) {
+          voiceTotalCostCents = doc["voice_total_cost_cents"].as<uint32_t>();
+          voiceTotalCostVisible = true;
+        }
+        if (doc["tool_total_cost_cents"].is<uint32_t>()) {
+          toolTotalCostCents = doc["tool_total_cost_cents"].as<uint32_t>();
+          toolTotalCostVisible = true;
+        }
+      }
       if (type == "connected") {
         pairedPcm = doc["audio"].as<String>() == "pcm-pair-v1";
+        bridgeVoiceResume = doc["voice_resume"] | false;
+        bridgeWakeWord = doc["wake_word"] | false;
+        if (bridgeWakeWord && wakeWordWaiting.load() && voiceWaiting.load()) sendControl("wake_word_wait");
+        bridgeVoiceCost = doc["voice_cost"] | false;
       } else if (type == "ready") {
         if (closing) break; // stop may cross an already queued startup ACK
         if (!starting || (doc["rate"] | 0) != 16000) {
           protocolFault = true;
           break;
         }
-        clearAudio();
+        clearAudio(voiceWaiting.load());
         locallyMuted = false;
         localInputHold = localOutputHold = false;
         echoUntil = 0;
@@ -443,16 +552,37 @@ void onSocket(WStype_t event, uint8_t* data, size_t length) {
         playbackVoiceLagMs.store(0, std::memory_order_relaxed);
         updatePlaybackPrebuffer(millis());
         active = true;
+        voiceWaiting = false;
+        wakeWordWaiting = false;
+        voiceTriggered = false;
+        lastVoiceMs = 0;
+        lastVoiceReport = 0;
         loopMaxMs = sendMaxMs = recvServiceMaxMs = sendStalls = 0;
         txWaitSince = txWaitMaxMs = txWaitEvents = failedSendMs = 0;
         status = "Ik luister";
       } else if (type == "closed") {
+        const String reason = doc["reason"] | "stopped";
+        const bool resumeRejected = reason == "resume_rejected";
+        const bool strict = reason == "wake_word_pause" && wakeWordWaiting.load();
+        const bool armVoice = (reason == "idle_timeout" || resumeRejected) && bridgeVoiceResume && active.load() &&
+            !closing && !localOutputHold.load() && !voiceTest::enabled();
         voiceTest::stop();
         clearAudio();
         starting = closing = mutePending = false;
-        const String reason = doc["reason"] | "stopped";
         if (lastStop == "none") lastStop = reason.substring(0, 64);
-        if (status == "Gesprek stoppen..." || lastStop == "user_stop") status = "Gesprek gestopt";
+        if (strict) {
+          localInputHold = locallyMuted.load();
+          localOutputHold = false;
+          wakeWordWaiting = voiceWaiting = true;
+          status = "Wacht op wake word";
+        } else if (armVoice) {
+          waitForWakeQuiet = resumeRejected;
+          voiceWaiting = true;
+          status = locallyMuted.load() ? "Microfoon gedempt" : "Ik luister";
+        } else if (reason == "idle_timeout" || resumeRejected ||
+                   status == "Gesprek stoppen..." || lastStop == "user_stop") {
+          status = "Gesprek gestopt";
+        }
         else if (reason == "time_limit") status = "10 minuten - start opnieuw";
         else if (status == "Ik luister") status = "Verbinding gestopt";
       } else if (type == "error") {
@@ -461,6 +591,9 @@ void onSocket(WStype_t event, uint8_t* data, size_t length) {
         stopConversation("Verbindingsfout - probeer opnieuw", "bridge_error");
       } else if (type == "voice_control") {
         handleVoiceControl(doc);
+      } else if (type == "wake_word_detected") {
+        if (bridgeWakeWord && wakeWordWaiting.load() && voiceWaiting.load() &&
+            !locallyMuted.load() && !starting && !closing) voiceTriggered = true;
       } else if (type == "muted") {
         const bool muted = doc["muted"] | true;
         if (!active.load() || !mutePending || muted != requestedMuteState) break;
@@ -493,10 +626,17 @@ void immediateUiCommand(UiCommand command, const UiSnapshot& snapshot) {
   }
 }
 
-bool startConversation() {
+bool startConversation(bool resume = false) {
   if (ui.sleeping() || head::isAligning(head::alignment()) || active.load() || starting || closing ||
       !audioReady || !connected || protocolFault) return false;
-  clearAudio();
+  if (resume && (!voiceWaiting.load() || localInputHold.load())) return false;
+  const bool wake = resume && wakeWordWaiting.load();
+  if (wake && !bridgeWakeWord) return false;
+  clearAudio(resume);
+  if (!resume) {
+    voiceCostCents = 0;
+    voiceCostVisible = bridgeVoiceCost;
+  }
   lastStop = "none";
   lastBridgeError = "";
   starting = true;
@@ -504,7 +644,11 @@ bool startConversation() {
   operationSince = millis();
   status = "Verbinding met OpenAI...";
   head::requestConversationPose();
-  sendControl("start");
+  if (resume) {
+    ++voiceWakeCount;
+    voiceWakeBuffered = uxQueueMessagesWaiting(captureQueue);
+  }
+  sendControl(wake ? "resume_wake_word" : resume ? "resume" : "start");
   return true;
 }
 
@@ -518,6 +662,11 @@ void handleUiCommands() {
     if (command == UiCommand::StopSession) {
       if (!closing && (active.load() || starting)) {
         stopConversation("Gesprek stoppen...", "user_stop");
+      } else if (voiceWaiting.load()) {
+        clearAudio();
+        if (connected && bridgeVoiceResume) sendControl("cancel_resume");
+        lastStop = "user_stop";
+        status = "Gesprek gestopt";
       }
     } else if (command == UiCommand::StartSession) {
       startConversation();
@@ -556,6 +705,14 @@ void publishUi(bool force = false) {
   snapshot.mutePending = mutePending;
   snapshot.starting = starting;
   snapshot.closing = closing;
+  snapshot.voiceWaiting = voiceWaiting.load();
+  snapshot.wakeWordWaiting = wakeWordWaiting.load();
+  snapshot.voiceCostVisible = voiceCostVisible;
+  snapshot.voiceCostCents = voiceCostCents;
+  snapshot.voiceTotalCostVisible = voiceTotalCostVisible;
+  snapshot.voiceTotalCostCents = voiceTotalCostCents;
+  snapshot.toolTotalCostVisible = toolTotalCostVisible;
+  snapshot.toolTotalCostCents = toolTotalCostCents;
   snapshot.connected = connected;
   snapshot.wifiConnected = WiFi.status() == WL_CONNECTED;
   snapshot.batteryPercent = batteryPercent();
@@ -571,6 +728,12 @@ void addStats(JsonObject stats) {
   stats["rx_samples"] = rxSamples.load();
   stats["tx_samples"] = txSamples.load();
   stats["net_input_frames"] = netInputFrames;
+  stats["voice_waiting"] = voiceWaiting.load();
+  stats["wake_word_waiting"] = wakeWordWaiting.load();
+  stats["voice_wake_count"] = voiceWakeCount.load();
+  stats["voice_gate_level"] = voiceGateLevel.load();
+  stats["voice_gate_threshold"] = voiceGateThreshold.load();
+  stats["voice_wake_buffered"] = voiceWakeBuffered.load();
   stats["net_output_frames"] = netOutputFrames;
   stats["capture_overflows"] = captureOverflows.load();
   stats["playback_overflows"] = playbackOverflows.load();
@@ -599,7 +762,7 @@ void addStats(JsonObject stats) {
   stats["standby_faults"] = standbyFaults;
   head::standbyStats(stats);
   // Bridge accepts only its fixed reason enum. Arbitrary remote codes stay USB-local.
-  const char* known[] = {"none","stopped","user_stop","capture_overflow","playback_overflow","audio_io","wifi_lost","protocol_error","bridge_error","operation_timeout","mute_timeout","audio_send_failed"};
+  const char* known[] = {"none","stopped","user_stop","capture_overflow","playback_overflow","audio_io","wifi_lost","protocol_error","bridge_error","operation_timeout","mute_timeout","audio_send_failed","wake_word_pause"};
   for (const char* code : known) if (lastStop == code) { stats["last_stop"] = code; break; }
 }
 
@@ -641,6 +804,11 @@ void handleSerial() {
                    !localOutputHold.load() && !locallyMuted.load() && volume.load() &&
                    static_cast<int32_t>(echoUntil.load()-millis()) <= 0)
           ok = voiceTest::say();
+        else if (serialLine == "TEST.WAKE_SAY" && idle && wakeWordWaiting.load() && voiceWaiting.load() &&
+                 !locallyMuted.load() && volume.load() && voiceTest::arm()) {
+          ok = voiceTest::say();
+          if (!ok) voiceTest::stop();
+        }
         else if ((serialLine == "TEST.JITTER" || serialLine == "TEST.JITTER1550") &&
                  voiceTest::enabled() && active.load() && !testStallUsed) {
           testStallUsed = true;
@@ -651,7 +819,8 @@ void handleSerial() {
           testTxResumeAt = millis() + 3200;
           ok = true;
         } else if (serialLine == "TEST.STOP" && voiceTest::enabled()) {
-          stopConversation("Gesprek stoppen...");
+          if (idle && wakeWordWaiting.load()) voiceTest::stop();
+          else stopConversation("Gesprek stoppen...");
           ok = true;
         }
         Serial.println(ok ? "TEST OK" : "TEST ERROR");
@@ -681,11 +850,17 @@ void handleSerial() {
         diag["mute_pending"] = mutePending;
         diag["free_heap"] = ESP.getFreeHeap();
         diag["ui_ready"] = ui.ready();
+        diag["wake_word_ready"] = bridgeWakeWord;
+        diag["wake_banner_position"] = ui.wakeBannerPosition();
+        diag["display_brightness"] = M5.Display.getBrightness();
         diag["standby"] = ui.sleeping();
         diag["standby_audio_off"] = standbyAudioOff;
         diag["standby_wifi_off"] = WiFi.getMode() == WIFI_OFF;
         diag["external_power"] = externalPowerPresent();
         diag["battery_percent"] = batteryPercent();
+        if (voiceCostVisible) diag["voice_cost_cents"] = voiceCostCents;
+        if (voiceTotalCostVisible) diag["voice_total_cost_cents"] = voiceTotalCostCents;
+        if (toolTotalCostVisible) diag["tool_total_cost_cents"] = toolTotalCostCents;
         diag["top_touch_ready"] = ui.topTouchReady();
         diag["top_wakes"] = ui.topWakes();
         diag["heart_bursts"] = ui.heartBursts();
@@ -694,11 +869,18 @@ void handleSerial() {
         diag["head_led_failures"] = ui.headLedFailures();
         if (M5.getBoard() == m5::board_t::board_M5StackChan) {
           auto& bus = M5.In_I2C;
-          uint8_t cfg, power[2], colors[14];
+          uint8_t cfg, power[2], colors[24];
           if (bus.readRegister(0x6f, 0x24, &cfg, 1, 100000)) diag["head_led_config"] = cfg;
           if (bus.readRegister(0x6f, 0x30, colors, sizeof(colors), 100000)) {
             diag["head_led_left_rgb565"] = colors[0] | (colors[1] << 8);
             diag["head_led_right_rgb565"] = colors[12] | (colors[13] << 8);
+            uint16_t leftGreen = 0, rightGreen = 0;
+            for (size_t i = 0; i < 12; i += 2) {
+              leftGreen += ((colors[i] | (colors[i + 1] << 8)) >> 5) & 0x3f;
+              rightGreen += ((colors[i + 12] | (colors[i + 13] << 8)) >> 5) & 0x3f;
+            }
+            diag["head_led_left_green_steps"] = leftGreen;
+            diag["head_led_right_green_steps"] = rightGreen;
           }
           if (bus.readRegister(0x58, 0x02, power, 2, 100000)) {
             diag["head_led_bus_enabled"] = (power[0] & 0x02) != 0;
@@ -749,9 +931,11 @@ void handleSerial() {
 
 void sendCapturedAudio() {
   const unsigned group = pairedPcm ? 2 : 1;
+  const bool listeningForWord = bridgeWakeWord && wakeWordWaiting.load() && voiceWaiting.load() &&
+      !starting && !closing && !locallyMuted.load() && !localInputHold.load();
   static uint8_t payload[2 * sizeof(AudioFrame::samples)];
   static const uint8_t silence[sizeof(payload)]{};
-  for (unsigned batch = 0; batch < 3 && active.load() && connected &&
+  for (unsigned batch = 0; batch < 3 && (active.load() || listeningForWord) && connected &&
        uxQueueMessagesWaiting(captureQueue) >= group; ++batch) {
     // Leave complete unsent frames queued while TCP is congested. Returning
     // to loop() services incoming speech and UI instead of blocking in TLS.
@@ -797,6 +981,7 @@ void sendCapturedAudio() {
       // command (including Stop) is valid on this stream.
       voiceTest::stop();
       clearAudio();
+      if (listeningForWord) wakeWordWaiting = voiceWaiting = true;
       lastStop = "audio_send_failed";
       status = "Bridge onbereikbaar";
       audioSocket.abortTransport();
@@ -826,9 +1011,10 @@ void maintainNetwork() {
   if (!socketStarted) {
     authHeader = "Authorization: Bearer " + cfg.token +
         "\r\nX-StackChan-Audio: pcm-pair-v1\r\nX-StackChan-Controls: voice-v1"
-        "\r\nX-StackChan-Sleep: 1";
+        "\r\nX-StackChan-Sleep: 1\r\nX-StackChan-Voice-Resume: 1\r\nX-StackChan-Voice-Cost: 1";
     if (ui.ready() && M5.getBoard() == m5::board_t::board_M5StackChan)
       authHeader += "\r\nX-StackChan-Align: 1";
+    authHeader += "\r\nX-StackChan-Wake-Word: bridge-v1";
     audioSocket.beginSslWithCA(cfg.host.c_str(), cfg.port, "/device", cfg.ca.c_str(), "");
     audioSocket.setExtraHeaders(authHeader.c_str());
     audioSocket.onEvent(onSocket);
@@ -966,7 +1152,7 @@ void setup() {
     return static_cast<int32_t>(echoUntil.load() - millis()) > 0 ?
         head::State::Speaking : head::State::Listening;
   });
-  Serial.println("STACKCHAN_READY v33");
+  Serial.println("STACKCHAN_READY v36");
 }
 
 void loop() {
@@ -983,6 +1169,7 @@ void loop() {
   const bool paused = voiceTest::enabled() && testStallUsed && static_cast<int32_t>(testResumeAt-millis()) > 0;
   if (!paused) maintainNetwork();
   handleUiCommands();
+  if (voiceWaiting.load() && voiceTriggered.load() && !starting) startConversation(true);
   if (wakeStartPending) {
     if (millis() - wakeRequestedAt >= kOperationTimeout) wakeStartPending = false;
     else startConversation();
@@ -995,7 +1182,9 @@ void loop() {
     stopConversation("Ongeldig bridgebericht", "protocol_error");
     audioSocket.disconnect();
   }
-  if ((starting || closing) && millis() - operationSince > kOperationTimeout) {
+  if (starting && voiceWaiting.load() && millis() - operationSince >= kVoiceResumeTimeoutMs) {
+    stopConversation("Spraakhervatting verlopen", "operation_timeout");
+  } else if ((starting || closing) && millis() - operationSince > kOperationTimeout) {
     clearAudio();
     starting = closing = false;
     status = "Verbinding verlopen";
@@ -1009,6 +1198,12 @@ void loop() {
     const uint32_t now = millis();
     if (active.load() && now - prebufferSampledAt >= kPrebufferSignalSampleMs) updatePlaybackPrebuffer(now);
     sendCapturedAudio();
+    const uint32_t lastVoice = lastVoiceMs.load();
+    if (active.load() && connected && bridgeVoiceResume && lastVoice && now - lastVoice <= 500 &&
+        now - lastVoiceReport >= 700 && !txWaitSince && !audioSocket.writeWouldBlock()) {
+      sendControl("voice_activity");
+      lastVoiceReport = now;
+    }
     if (!active.load() || !txWaitSince) sendDiagnostics();
   }
   if (head::takeAlignmentSaved()) status = "Middenstand bewaard";

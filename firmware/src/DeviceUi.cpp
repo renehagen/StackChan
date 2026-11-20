@@ -28,10 +28,13 @@ constexpr uint32_t kTopTouchI2cHz = 100000;
 // StackChan-BSP drives the two six-pixel strips through the PY32 expander.
 // https://github.com/m5stack/StackChan-BSP/blob/main/src/drivers/PY32IOExpander/PY32IOExpander.cpp
 constexpr uint8_t kLedExpander = 0x6f, kLedConfig = 0x24, kLedRam = 0x30;
-constexpr uint8_t kLedCount = 12, kLedRefresh = 1 << 6;
+constexpr uint8_t kLedStripPixels = 6, kLedCount = 2 * kLedStripPixels, kLedRefresh = 1 << 6;
 constexpr uint32_t kLedI2cHz = 100000;
 constexpr uint16_t kLedOff = 0, kLedGreen = m5gfx::color565(0, 144, 0),
-                   kLedOrange = m5gfx::color565(144, 52, 0);
+                   kLedOrange = m5gfx::color565(144, 52, 0),
+                   kLedDimOrange = m5gfx::color565(12, 4, 0);
+constexpr uint8_t kWakeBrightness = 64;
+constexpr uint32_t kWakeMoveIntervalMs = 30000;
 constexpr int kSpeechPattern[] = {1, 2, 1, 3, 1};
 constexpr int kBarPitch = 10;
 
@@ -66,27 +69,79 @@ void pushRegion(Canvas& c, Rect r) {
   M5.Display.clearClipRect();
 }
 
-bool showStop(const UiSnapshot& s) { return s.active || s.starting || s.closing; }
-bool canSession(const UiSnapshot& s) { return !s.closing && (s.active || s.starting || s.connected); }
-bool canMute(const UiSnapshot& s) { return s.active && !s.closing && !s.mutePending; }
+bool showStop(const UiSnapshot& s) { return s.active || s.starting || s.closing || s.voiceWaiting; }
+bool canSession(const UiSnapshot& s) { return !s.closing && (s.active || s.starting || s.connected || s.voiceWaiting); }
+bool showsConversation(const UiSnapshot& s) { return s.active || s.voiceWaiting; }
+bool canMute(const UiSnapshot& s) { return showsConversation(s) && !s.starting && !s.closing && !s.mutePending; }
 
 void valueText(char (&text)[8], uint8_t percent) {
   std::snprintf(text, sizeof(text), "%u%%", static_cast<unsigned>(percent));
 }
 
+void dollarsText(char (&text)[16], uint32_t cents) {
+  std::snprintf(text, sizeof(text), "$%u.%02u", static_cast<unsigned>(cents / 100),
+                static_cast<unsigned>(cents % 100));
+}
+
 void statusLine(Canvas& c, const UiSnapshot& s) {
   c.fillRect(0, 0, kWidth, kHeader.h, kBackground);
-  if (s.active && (s.muted || s.mutePending)) {
-    c.fillSmoothCircle(13, 17, 5, kMuted);
+  const int cloudX = s.batteryPercent >= 0 ? 205 : 273;
+  const int endX = s.voiceWaiting ? cloudX - 15 : s.batteryPercent >= 0 ? 212 : 289;
+  const bool stackedCosts = s.voiceCostVisible && (s.voiceTotalCostVisible || s.toolTotalCostVisible);
+  const int topY = stackedCosts ? 11 : 17;
+  int muteX = 26;
+  c.setTextSize(1);
+  c.setFont(&fonts::FreeSansBold9pt7b);
+  c.setTextColor(kMuted, kBackground);
+  c.setTextDatum(middle_left);
+  int costWidth = 0;
+  if (s.voiceCostVisible) {
+    char amount[16];
+    dollarsText(amount, s.voiceCostCents);
+    c.drawString(amount, 10, topY);
+    costWidth = c.textWidth(amount);
+  }
+  if (s.voiceTotalCostVisible || s.toolTotalCostVisible) {
+    char voice[16], tools[16], totals[48];
+    dollarsText(voice, s.voiceTotalCostCents);
+    dollarsText(tools, s.toolTotalCostCents);
+    if (s.voiceTotalCostVisible && s.toolTotalCostVisible)
+      std::snprintf(totals, sizeof(totals), "Totaal %s   Tools %s", voice, tools);
+    else
+      std::snprintf(totals, sizeof(totals), "%s %s", s.voiceTotalCostVisible ? "Totaal" : "Tools",
+                    s.voiceTotalCostVisible ? voice : tools);
+    if (c.textWidth(totals) > endX - 10) c.setFont(&fonts::Font2);
+    if (c.textWidth(totals) > endX - 10) c.setFont(&fonts::Font0);
+    c.drawString(totals, 10, stackedCosts ? 28 : 17);
+    if (!stackedCosts) costWidth = c.textWidth(totals);
+  }
+  if (costWidth) muteX += costWidth + 8;
+  if (showsConversation(s) && (s.muted || s.mutePending)) {
+    if (muteX - 8 <= endX) c.fillSmoothCircle(muteX - 13, topY, 5, kMuted);
     c.setTextSize(1);
-    c.setFont(&fonts::FreeSansBold12pt7b);
+    c.setFont(stackedCosts ? &fonts::FreeSansBold9pt7b : &fonts::FreeSansBold12pt7b);
     c.setTextColor(kWhite, kBackground);
     c.setTextDatum(middle_left);
     const char* label = s.mutePending ? "Microfoon omschakelen..." : "Microfoon gedempt";
-    const int maxWidth = s.batteryPercent >= 0 ? 186 : 263;
+    const int maxWidth = endX - muteX;
     if (c.textWidth(label) > maxWidth) c.setFont(&fonts::FreeSansBold9pt7b);
     if (c.textWidth(label) > maxWidth) c.setFont(&fonts::Font2);
-    c.drawString(label, 26, 17);
+    if (c.textWidth(label) > maxWidth) label = s.mutePending ? "Wachten..." : "Mic gedempt";
+    if (c.textWidth(label) <= maxWidth) c.drawString(label, muteX, topY);
+  }
+  if (s.voiceWaiting) {
+    c.drawWideLine(cloudX - 7, 21, cloudX - 9, 18, 1, kMuted);
+    c.drawWideLine(cloudX - 9, 18, cloudX - 7, 14, 1, kMuted);
+    c.drawWideLine(cloudX - 7, 14, cloudX - 4, 14, 1, kMuted);
+    c.drawWideLine(cloudX - 4, 14, cloudX - 2, 10, 1, kMuted);
+    c.drawWideLine(cloudX - 2, 10, cloudX + 3, 10, 1, kMuted);
+    c.drawWideLine(cloudX + 3, 10, cloudX + 6, 14, 1, kMuted);
+    c.drawWideLine(cloudX + 6, 14, cloudX + 9, 16, 1, kMuted);
+    c.drawWideLine(cloudX + 9, 16, cloudX + 9, 19, 1, kMuted);
+    c.drawWideLine(cloudX + 9, 19, cloudX + 7, 21, 1, kMuted);
+    c.drawWideLine(cloudX - 7, 21, cloudX + 7, 21, 1, kMuted);
+    c.drawWideLine(cloudX - 9, 8, cloudX + 10, 23, 3, kBackground);
+    c.drawWideLine(cloudX - 9, 8, cloudX + 10, 23, 1, kMuted);
   }
   if (s.batteryPercent >= 0) {
     const uint32_t ink = s.batteryPercent <= 15 ? kPeach : kMuted;
@@ -211,7 +266,7 @@ void button(Canvas& c, Rect r, Icon shape, const char* label, uint32_t bg, uint3
 void toolbar(Canvas& c, const UiSnapshot& s, bool volumeOpen) {
   c.fillRect(0, kFooter.y, kWidth, kFooter.h, kBackground);
   const uint32_t micInk = canMute(s) ? kWhite : kMuted;
-  const bool muted = s.active && s.muted;
+  const bool muted = showsConversation(s) && s.muted;
   button(c, kMic, muted ? Icon::Muted : Icon::Mic, muted ? "Mic aan" : "Demp", kButton, micInk, micInk);
   char value[8]; valueText(value, s.volume);
   button(c, kVolume, Icon::Speaker, value, volumeOpen ? 0x364C60 : kButton, kWhite, kWhite);
@@ -307,18 +362,18 @@ constexpr size_t kHeartCount = sizeof(kHearts) / sizeof(kHearts[0]);
 constexpr size_t kHeartScratchPixels = kLargeHeart * kLargeHeart;
 constexpr uint32_t kHeartTouchCooldownMs = 1950;
 constexpr uint32_t kHeartPulsePeriodMs = 1200;
+constexpr uint32_t kWakePulsePeriodMs = 3 * kHeartPulsePeriodMs;
+constexpr uint32_t kPulseRiseMs = 360;
+constexpr uint8_t kWakeGreenMin = (63 * kLedStripPixels + 9) / 10, kWakeGreenMax = 90;
 constexpr uint32_t kHeartPulseMinMs = 10 * kHeartPulsePeriodMs;
 constexpr int kHeartSpawnPeriodMs = 2 * kHeartPulsePeriodMs;
 constexpr uint32_t kLedFrameMs = 20;
 
-uint16_t heartPulseColor(uint32_t age) {
-  constexpr uint32_t riseMs = 360, fadeMs = 640;
-  // One gentle rise, a longer fade, and a dark pause on every beat.
-  const uint32_t phase = age % kHeartPulsePeriodMs;
-  const float level = phase < riseMs ? static_cast<float>(phase) / riseMs :
-      std::max(0.0f, 1.0f - static_cast<float>(phase - riseMs) / fadeMs);
-  const uint8_t red = std::lround(152 * level * level * (3 - 2 * level));
-  return m5gfx::color565(red, 0, 0);
+uint8_t pulseIntensity(uint32_t age, uint32_t period, uint8_t peak, uint32_t fadeMs) {
+  const uint32_t phase = (age % period) * kHeartPulsePeriodMs / period;
+  const float level = phase < kPulseRiseMs ? static_cast<float>(phase) / kPulseRiseMs :
+      std::max(0.0f, 1.0f - static_cast<float>(phase - kPulseRiseMs) / fadeMs);
+  return std::lround(peak * level * level * (3 - 2 * level));
 }
 
 struct HeartFrame {
@@ -508,7 +563,9 @@ const char* DeviceUi::headLedState() const {
     case HeadLedMode::Off: return "off";
     case HeadLedMode::Green: return "green";
     case HeadLedMode::Orange: return "orange";
-    case HeadLedMode::Pulse: return "red_pulse";
+    case HeadLedMode::DimOrange: return "orange_dim";
+    case HeadLedMode::RedPulse: return "red_pulse";
+    case HeadLedMode::GreenPulse: return "green_pulse";
     default: return "unknown";
   }
 }
@@ -554,14 +611,16 @@ bool DeviceUi::setHeadLedPower(bool on) {
 
 void DeviceUi::requestHeadLed(HeadLedMode mode, uint32_t now) {
   if (!headLedsSupported_) return;
-  const uint32_t duration = mode == HeadLedMode::Off ? 0 : heartAnimationDuration_;
-  const HeadLedRequest request{mode, duration ? heartAnimationStartedAt_ : 0, duration};
-  if (!headLedRequests_) {
-    updateHeadLeds(request, now);
-  } else if (request.mode != lastHeadLedRequest_.mode ||
-             request.startedAt != lastHeadLedRequest_.startedAt || request.duration != lastHeadLedRequest_.duration) {
+  const uint32_t duration = (mode == HeadLedMode::Green || mode == HeadLedMode::Orange) ? heartAnimationDuration_ : 0;
+  uint32_t startedAt = duration ? heartAnimationStartedAt_ : 0;
+  if (mode == HeadLedMode::GreenPulse)
+    startedAt = lastHeadLedRequest_.mode == mode ? lastHeadLedRequest_.startedAt : now;
+  const HeadLedRequest request{mode, startedAt, duration};
+  if (!headLedRequests_ || request.mode != lastHeadLedRequest_.mode ||
+      request.startedAt != lastHeadLedRequest_.startedAt || request.duration != lastHeadLedRequest_.duration) {
     lastHeadLedRequest_ = request;
-    xQueueOverwrite(headLedRequests_, &request);
+    if (headLedRequests_) xQueueOverwrite(headLedRequests_, &request);
+    else updateHeadLeds(request, now);
   }
 }
 
@@ -572,7 +631,7 @@ void DeviceUi::runHeadLeds() {
     const auto applied = headLedMode_.load(std::memory_order_relaxed);
     const uint32_t age = millis() - request.startedAt;
     TickType_t wait = applied == HeadLedMode::Unknown ? pdMS_TO_TICKS(250) : portMAX_DELAY;
-    if (applied == HeadLedMode::Pulse || age < request.duration) {
+    if (applied == HeadLedMode::RedPulse || request.mode == HeadLedMode::GreenPulse || age < request.duration) {
       // Use the next point on the original clock. Display work and new
       // touch requests therefore cannot move the start of a beat.
       wait = std::max<TickType_t>(1, pdMS_TO_TICKS(kLedFrameMs - age % kLedFrameMs));
@@ -584,14 +643,23 @@ void DeviceUi::runHeadLeds() {
 void DeviceUi::updateHeadLeds(const HeadLedRequest& request, uint32_t now) {
   HeadLedMode mode = request.mode;
   const bool active = mode != HeadLedMode::Off;
-  uint16_t color = mode == HeadLedMode::Orange ? kLedOrange : active ? kLedGreen : kLedOff;
+  uint16_t color = mode == HeadLedMode::DimOrange ? kLedDimOrange :
+                   mode == HeadLedMode::Orange ? kLedOrange : active ? kLedGreen : kLedOff;
+  uint8_t brighterPixels = 0;
   const uint32_t age = now - request.startedAt;
+  const uint32_t pulseAge = age / kLedFrameMs * kLedFrameMs;
   if (age < request.duration) {
-    mode = HeadLedMode::Pulse;
-    color = heartPulseColor(age / kLedFrameMs * kLedFrameMs);
+    mode = HeadLedMode::RedPulse;
+    color = m5gfx::color565(pulseIntensity(pulseAge, kHeartPulsePeriodMs, 152, 640), 0, 0);
+  } else if (mode == HeadLedMode::GreenPulse) {
+    // Distribute fractions of an RGB565 green level across each six-pixel strip.
+    const uint8_t green = kWakeGreenMin + pulseIntensity(pulseAge, kWakePulsePeriodMs,
+        kWakeGreenMax - kWakeGreenMin, kHeartPulsePeriodMs - kPulseRiseMs);
+    color = (green / kLedStripPixels) << 5;
+    brighterPixels = green % kLedStripPixels;
   }
   const auto previous = headLedMode_.load(std::memory_order_relaxed);
-  if ((previous == mode && headLedColor_ == color) ||
+  if ((previous == mode && headLedColor_ == color && headLedBrighterPixels_ == brighterPixels) ||
       (headLedRetryAt_ && static_cast<int32_t>(now - headLedRetryAt_) < 0)) return;
 
   const bool wasPowered = previous != HeadLedMode::Off && previous != HeadLedMode::Unknown;
@@ -607,9 +675,11 @@ void DeviceUi::updateHeadLeds(const HeadLedRequest& request, uint32_t now) {
                          bus.writeRegister8(kLedExpander, kLedConfig, kLedCount, kLedI2cHz);
   }
   uint8_t pixels[kLedCount * 2];
-  for (size_t i = 0; i < sizeof(pixels); i += 2) {
-    pixels[i] = static_cast<uint8_t>(color);
-    pixels[i + 1] = static_cast<uint8_t>(color >> 8);
+  constexpr uint8_t brightenOrder[kLedStripPixels]{0, 4, 2, 5, 1, 3};
+  for (size_t i = 0; i < kLedCount; ++i) {
+    const uint16_t pixel = color + (brightenOrder[i % kLedStripPixels] < brighterPixels ? 1 << 5 : 0);
+    pixels[2 * i] = static_cast<uint8_t>(pixel);
+    pixels[2 * i + 1] = static_cast<uint8_t>(pixel >> 8);
   }
   const bool written = powered && headLedsConfigured_ &&
       bus.writeRegister(kLedExpander, kLedRam, pixels, sizeof(pixels), kLedI2cHz);
@@ -617,6 +687,7 @@ void DeviceUi::updateHeadLeds(const HeadLedRequest& request, uint32_t now) {
   const bool powerReleased = active || setHeadLedPower(false);
   if (refreshed && powerReleased) {
     headLedColor_ = color;
+    headLedBrighterPixels_ = brighterPixels;
     headLedMode_.store(mode, std::memory_order_relaxed);
     headLedRetryAt_ = 0;
   } else {
@@ -635,13 +706,16 @@ void DeviceUi::run() {
   uint32_t idleSince = millis(), lastTopPoll = idleSince;
   bool previousTopSample = false, topTouch = false;
   uint8_t savedBrightness = 0;
+  uint8_t beforeWakeBrightness = 0;
+  bool wakeDimmed = false;
   bool wakePending = false;
   topTouchReady_ = setupTopTouch();
   for (;;) {
     if (xQueueReceive(snapshots_, &incoming, 0) == pdTRUE) current = incoming;
     M5.update();
     const uint32_t now = millis();
-    const bool busy = current.active || current.starting || current.closing || head::isAligning(current.alignment);
+    const bool busy = current.active || current.starting || current.closing || current.voiceWaiting ||
+                      head::isAligning(current.alignment);
     const bool screenTouch = M5.Touch.getDetail().wasPressed();
     bool topPressed = false;
     if (topTouchReady() && now - lastTopPoll >= kTopTouchPollMs) {
@@ -690,9 +764,17 @@ void DeviceUi::run() {
       panelButtonMask_ = 0;
       continue;
     }
-    const bool sessionActive = current.active && !current.closing;
-    if (!sessionActive || now - heartAnimationStartedAt_ >= heartAnimationDuration_) heartAnimationDuration_ = 0;
-    if (topPressed && sessionActive &&
+    if (current.wakeWordWaiting != wakeDimmed) {
+      if (current.wakeWordWaiting) {
+        beforeWakeBrightness = M5.Display.getBrightness();
+        M5.Display.setBrightness(kWakeBrightness);
+      } else M5.Display.setBrightness(beforeWakeBrightness);
+      wakeDimmed = current.wakeWordWaiting;
+    }
+    const bool sessionActive = showsConversation(current) && !current.closing;
+    if (!sessionActive || current.wakeWordWaiting || now - heartAnimationStartedAt_ >= heartAnimationDuration_)
+      heartAnimationDuration_ = 0;
+    if (topPressed && sessionActive && !current.wakeWordWaiting &&
         (!heartAnimationDuration_ || now - lastHeartTouchAt_ >= kHeartTouchCooldownMs)) {
       lastHeartTouchAt_ = now;
       heartBursts_.fetch_add(1, std::memory_order_relaxed);
@@ -703,10 +785,11 @@ void DeviceUi::run() {
       const auto nextBeat = (age + kHeartPulsePeriodMs - 1) / kHeartPulsePeriodMs * kHeartPulsePeriodMs;
       heartAnimationDuration_ = nextBeat + kHeartPulseMinMs;
     }
-    requestHeadLed(!sessionActive ? HeadLedMode::Off : current.muted ? HeadLedMode::Orange : HeadLedMode::Green, now);
+    requestHeadLed(current.wakeWordWaiting ? (current.muted ? HeadLedMode::DimOrange : HeadLedMode::GreenPulse) :
+                   !sessionActive ? HeadLedMode::Off : current.muted ? HeadLedMode::Orange : HeadLedMode::Green, now);
     if (!firstPaint_) handleTouch(painted_);
     if (volumeOpen_ && now - volumeTouchedAt_ >= 5000) volumeOpen_ = false;
-    if (now - lastRender >= (current.active ? kWaveFrameMs : kIdleFrameMs)) {
+    if (now - lastRender >= ((showsConversation(current) && !current.wakeWordWaiting) ? kWaveFrameMs : kIdleFrameMs)) {
       current.speaking = current.active && current.volume &&
           static_cast<int32_t>(speakingUntil_.load() - now) > 0;
       render(current, now);
@@ -717,6 +800,7 @@ void DeviceUi::run() {
 }
 
 void DeviceUi::handleTouch(const UiSnapshot& snapshot) {
+  if (snapshot.wakeWordWaiting) return;
   const auto touch = M5.Touch.getDetail();
   if (!touch.wasPressed()) return;
   const uint32_t now = millis();
@@ -766,6 +850,42 @@ void DeviceUi::handleTouch(const UiSnapshot& snapshot) {
 
 void DeviceUi::render(const UiSnapshot& s, uint32_t now) {
   auto& c = *canvas_;
+  if (s.wakeWordWaiting) {
+    constexpr Rect places[] = {{36, 154, 248, 28}, {16, 49, 248, 28}, {54, 104, 248, 28},
+                               {25, 197, 248, 28}, {47, 74, 248, 28}, {22, 128, 248, 28}};
+    if (!painted_.wakeWordWaiting || firstPaint_) {
+      wakeBannerStartedAt_ = now;
+      wakeBannerPosition_ = -1;
+    }
+    const unsigned slot = ((now - wakeBannerStartedAt_) / kWakeMoveIntervalMs) % (sizeof(places) / sizeof(*places));
+    if (static_cast<int>(slot) != wakeBannerPosition()) {
+      const auto& place = places[slot];
+      constexpr uint32_t purple = 0x504499;
+      c.fillScreen(0x000000);
+      c.fillSmoothRoundRect(place.x, place.y, place.w, place.h, 7, purple);
+      c.setTextDatum(middle_center);
+      c.setTextSize(1);
+      c.setTextColor(kWhite, purple);
+      c.setFont(&fonts::FreeSansBold9pt7b);
+      c.drawString("Wacht op wake word", place.x + place.w / 2, place.y + place.h / 2);
+      c.pushSprite(0, 0);
+      wakeBannerPosition_ = slot;
+    }
+    micPeak_.exchange(0, std::memory_order_relaxed);
+    speakerPeak_.exchange(0, std::memory_order_relaxed);
+    controlsVisible_ = false;
+    panelButtonMask_ = 0;
+    volumeOpen_ = false;
+    paintedHeartAge_ = -1;
+    waveMode_ = WaveMode::Idle;
+    painted_ = s;
+    firstPaint_ = false;
+    return;
+  }
+  if (painted_.wakeWordWaiting) {
+    firstPaint_ = true;
+    wakeBannerPosition_ = -1;
+  }
   if (head::isAligning(s.alignment)) {
     if (firstPaint_ || s.alignment != painted_.alignment || s.wifiConnected != painted_.wifiConnected ||
         s.batteryPercent != painted_.batteryPercent) {
@@ -783,24 +903,29 @@ void DeviceUi::render(const UiSnapshot& s, uint32_t now) {
   }
   if (head::isAligning(painted_.alignment)) firstPaint_ = true;
   const bool first = firstPaint_;
-  if (first || s.active != painted_.active) controlsTouchedAt_ = now;
-  const bool visible = !s.active || now - controlsTouchedAt_ < kControlsTimeoutMs;
+  const bool conversation = showsConversation(s);
+  if (first || conversation != showsConversation(painted_)) controlsTouchedAt_ = now;
+  const bool visible = !conversation || now - controlsTouchedAt_ < kControlsTimeoutMs;
   const bool visibilityChanged = first || visible != controlsVisible();
   const bool statusChanged = std::strcmp(s.status, painted_.status) != 0;
-  const bool header = first || s.active != painted_.active || s.wifiConnected != painted_.wifiConnected ||
+  const bool header = first || conversation != showsConversation(painted_) ||
+      s.voiceWaiting != painted_.voiceWaiting || s.wifiConnected != painted_.wifiConnected ||
+      s.voiceCostVisible != painted_.voiceCostVisible || s.voiceCostCents != painted_.voiceCostCents ||
+      s.voiceTotalCostVisible != painted_.voiceTotalCostVisible || s.voiceTotalCostCents != painted_.voiceTotalCostCents ||
+      s.toolTotalCostVisible != painted_.toolTotalCostVisible || s.toolTotalCostCents != painted_.toolTotalCostCents ||
       s.batteryPercent != painted_.batteryPercent ||
-      (s.active && (s.muted != painted_.muted || s.mutePending != painted_.mutePending));
-  const WaveMode mode = !s.active ? WaveMode::Idle : s.speaking ? WaveMode::Speaking :
+      (conversation && (s.muted != painted_.muted || s.mutePending != painted_.mutePending));
+  const WaveMode mode = !conversation ? WaveMode::Idle : s.speaking ? WaveMode::Speaking :
       (s.muted || s.mutePending) ? WaveMode::Muted : WaveMode::Listening;
   const bool speaking = mode == WaveMode::Speaking;
   const bool modeChanged = mode != waveMode_;
   const bool volumeLayoutChanged = volumeOpen_ != paintedVolumeOpen_;
-  const bool body = first || modeChanged || (s.active ? volumeLayoutChanged : statusChanged);
+  const bool body = first || modeChanged || (conversation ? volumeLayoutChanged : statusChanged);
   const bool panel = body || volumeLayoutChanged ||
       (volumeOpen_ && s.volume != painted_.volume);
   const bool footer = visibilityChanged || volumeOpen_ != paintedVolumeOpen_ || s.volume != painted_.volume ||
       showStop(s) != showStop(painted_) || canSession(s) != canSession(painted_) ||
-      canMute(s) != canMute(painted_) || (s.active && s.muted) != (painted_.active && painted_.muted);
+      canMute(s) != canMute(painted_) || (conversation && s.muted) != (showsConversation(painted_) && painted_.muted);
 
   const uint32_t mic = micPeak_.exchange(0, std::memory_order_relaxed);
   const uint32_t speaker = speakerPeak_.exchange(0, std::memory_order_relaxed);
@@ -837,7 +962,7 @@ void DeviceUi::render(const UiSnapshot& s, uint32_t now) {
   const int scale = volumeOpen_ ? 41 : 59;
   const int height = *std::max_element(waveHistory_.begin(), waveHistory_.end()) * scale / 255;
   const int previousHeight = listeningWaveHeight();
-  const bool wave = s.active && !speaking && (body || height > 1 || previousHeight > 1);
+  const bool wave = conversation && !speaking && (body || height > 1 || previousHeight > 1);
   const bool speech = speaking &&
       (body || speechUnit != paintedSpeechUnit_ || speechPairs != paintedSpeechPairs_);
   const int heartAge = heartAnimationDuration_ ? static_cast<int>(now - heartAnimationStartedAt_) : -1;
@@ -848,7 +973,7 @@ void DeviceUi::render(const UiSnapshot& s, uint32_t now) {
   if (first) c.fillScreen(kBackground);
   if (body) c.fillRect(kBody.x, kBody.y, kBody.w, kBody.h, kBackground);
   if (header) statusLine(c, s);
-  if (body && !s.active) idleStatus(c, s);
+  if (body && !conversation) idleStatus(c, s);
   Rect audioArea{};
   const int y = volumeOpen_ ? 92 : 116;
   if (speech) {
@@ -875,7 +1000,7 @@ void DeviceUi::render(const UiSnapshot& s, uint32_t now) {
       if (height > 1) listeningWaveFrames_.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  if (panel && (!s.active || volumeOpen_)) {
+  if (panel && (!conversation || volumeOpen_)) {
     c.fillRect(0, kVolumePanel.y, kWidth, kVolumePanel.h, kBackground);
     if (volumeOpen_) volumePanel(c, s.volume);
   }

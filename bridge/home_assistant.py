@@ -24,16 +24,20 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from websockets.asyncio.client import connect
+from websockets.exceptions import WebSocketException
+
 if __package__:
-    from .ha_names import Target, context_targets, find_targets, name_key
+    from .ha_names import Target, context_targets, find_targets, name_key, scoped_targets
 else:
-    from ha_names import Target, context_targets, find_targets, name_key
+    from ha_names import Target, context_targets, find_targets, name_key, scoped_targets
 
 
 PROTOCOL_VERSION = "2025-03-26"
 MAX_BODY = 1024 * 1024
 MAX_OUTPUT = 24000
 MAX_ARGUMENTS = 16384
+MAX_SUGGESTION_TARGETS = 384
 TARGET_CACHE_LIMIT = 32
 TARGET_CACHE_TTL = 3 * 86400
 ALIAS_LIMIT = 32
@@ -41,9 +45,17 @@ TARGET_DOMAINS = frozenset({"light", "switch", "scene", "fan", "climate", "media
 SAVE_ALIAS_TOOL = "ha_SaveAlias"
 FIND_TARGET_TOOL = "ha_FindTarget"
 ACTIVATE_SCENE_TOOL = "ha_ActivateScene"
+SET_AREA_DEVICES_TOOL = "ha_SetAreaDevices"
+SET_LOCK_TOOL = "ha_SetLock"
+AREA_DEVICE_DOMAINS = frozenset({"light", "switch", "fan", "climate", "media_player"})
+AREA_ACTIONS = {"on": "ha_HassTurnOn", "off": "ha_HassTurnOff"}
+LOCK_ACTIONS = {"lock": "ha_HassTurnOn", "unlock": "ha_HassTurnOff"}
 ATOMS3_TOOL = "ha_script_stackchan_atoms3_ledstrip"
 ATOMS3_NAME = "AtomS3 LED Strip"
 CATALOG_TTL = 45
+CONTEXT_REFRESH_SECONDS = 300
+CONTEXT_MAX_AGE = 900
+CONTEXT_MAX_BYTES = 24000
 READ_ATTEMPT_TIMEOUT = 3.0
 READ_ONLY_TOOLS = frozenset({"GetLiveContext", "HassGetState"})
 TOOL_DOMAINS = {"ha_HassLightSet": "light", "ha_HassClimateSetTemperature": "climate",
@@ -91,6 +103,11 @@ def error_detail(value: Any) -> str | None:
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise HomeAssistantError("redirect_refused")
+
+
+class _LocalWebSocket(connect):
+    def process_redirect(self, exc: Exception) -> Exception:
+        return exc
 
 
 async def _finish_thread(function, *args, **kwargs):
@@ -330,6 +347,8 @@ class HomeAssistantTools:
         self._catalog_lock = asyncio.Lock()
         self._catalog_rows: list[Target] = []
         self._catalog_until = 0.0
+        self._area_names: dict[str, list[str]] = {}
+        self._areas_read_at = -CONTEXT_MAX_AGE
 
     def _http(self, path: str, body: bytes, *, form: bool = False, request_id: int | None = None,
               timeout: float | None = None) -> tuple[Any, str | None]:
@@ -478,7 +497,8 @@ class HomeAssistantTools:
                 "type": "function", "name": FIND_TARGET_TOOL, "strict": False,
                 "description": ("Find one exposed Home Assistant device, scene or enabled script by its spoken name, "
                                 "including spacing variants and small typos. This is a read-only lookup. Use domain "
-                                "script or scene when specified, and use the returned exact name or script tool."),
+                                "script or scene when specified. An unresolved query can return candidates for "
+                                "semantic comparison before asking the user to clarify."),
                 "parameters": {"type": "object", "properties": {
                     "name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "string"},
                 }, "required": ["name"], "additionalProperties": False},
@@ -493,6 +513,25 @@ class HomeAssistantTools:
                 "parameters": {"type": "object", "properties": {
                     "name": {"type": "string"}, "area": {"type": "string"},
                 }, "required": ["name"], "additionalProperties": False},
+            }
+        for tool, field, actions, description in (
+            (SET_AREA_DEVICES_TOOL, "area", AREA_ACTIONS,
+             "Turn all exposed devices of the requested type in one Home Assistant area on or off. "
+             "Use when the request identifies a room and a device type without naming an individual device."),
+            (SET_LOCK_TOOL, "name", LOCK_ACTIONS,
+             "Lock or unlock one explicitly named Home Assistant lock. Requires an exact exposed "
+             "name or alias. Never use for lights, doors without a lock or unspecified locks."),
+        ):
+            if not all({field, "domain"} <= tools.get(native, {}).get("parameters", {}).get("properties", {}).keys()
+                       for native in actions.values()):
+                continue
+            properties = {field: {"type": "string"}, "action": {"type": "string", "enum": list(actions)}}
+            if tool == SET_AREA_DEVICES_TOOL:
+                properties["domain"] = {"type": "string", "enum": sorted(AREA_DEVICE_DOMAINS)}
+            tools[tool] = {
+                "type": "function", "name": tool, "strict": False, "description": description,
+                "parameters": {"type": "object", "properties": properties,
+                               "required": list(properties), "additionalProperties": False},
             }
         if self._cache_path and "ha_GetLiveContext" in tools:
             tools[SAVE_ALIAS_TOOL] = {
@@ -539,6 +578,7 @@ class HomeAssistantTools:
             if not isinstance(result, dict) or result.get("isError"):
                 return []
             rows = []
+            valid = False
             content = result.get("content")
             for item in content if isinstance(content, list) else ():
                 try:
@@ -546,24 +586,119 @@ class HomeAssistantTools:
                 except (TypeError, KeyError, ValueError):
                     continue
                 if isinstance(payload, dict) and payload.get("success") is True and isinstance(payload.get("result"), str):
+                    valid = True
                     rows.extend(context_targets(payload["result"]))
-            if rows:
+            if valid:
                 self._catalog_rows = rows
                 self._catalog_until = time.monotonic() + CATALOG_TTL
             return rows
 
-    async def _find_target(self, name: str, domains: tuple[str, ...] = (), area: str | None = None) -> dict[str, Any]:
-        candidates = [] if domains and set(domains) == {"script"} else await self._target_catalog()
-        matches = find_targets(name, candidates + self._script_targets(), domains=domains, area=area)
+    async def _read_areas(self) -> dict[str, list[str]]:
+        await self._ensure_auth()
+        base_url = self._auth["base_url"]
+        scheme = "wss" if base_url.startswith("https:") else "ws"
+        url = scheme + base_url[base_url.index(":"):] + "/api/websocket"
+        async with asyncio.timeout(READ_ATTEMPT_TIMEOUT):
+            async with _LocalWebSocket(url, proxy=None, compression=None, close_timeout=1,
+                                       max_size=MAX_BODY) as socket:
+                greeting = json.loads(await socket.recv())
+                if not isinstance(greeting, dict) or greeting.get("type") != "auth_required":
+                    raise HomeAssistantError("invalid_area_registry_response")
+                await socket.send(json.dumps({"type": "auth", "access_token": self._auth["access_token"]}))
+                auth = json.loads(await socket.recv())
+                if not isinstance(auth, dict) or auth.get("type") != "auth_ok":
+                    raise HomeAssistantError("area_registry_auth_failed")
+                await socket.send('{"id":1,"type":"config/area_registry/list"}')
+                response = json.loads(await socket.recv())
+        if (not isinstance(response, dict) or response.get("id") != 1
+                or response.get("success") is not True or not isinstance(response.get("result"), list)):
+            raise HomeAssistantError("invalid_area_registry_response")
+        areas = {}
+        for row in response["result"]:
+            if not isinstance(row, dict) or not (name := _target_label(row.get("name"))):
+                continue
+            aliases = row.get("aliases")
+            areas[name] = sorted({alias for alias in aliases if _target_label(alias)}) if isinstance(aliases, list) else []
+        return areas
+
+    async def refresh_context(self) -> tuple[bool, bool]:
+        async def refresh_targets() -> bool:
+            if "ha_GetLiveContext" not in self._tools:
+                return False
+            try:
+                await self._target_catalog()
+            except HomeAssistantError:
+                return False
+            return time.monotonic() < self._catalog_until
+
+        async def refresh_areas() -> bool:
+            try:
+                self._area_names = await self._read_areas()
+            except (HomeAssistantError, OSError, TimeoutError, ValueError, WebSocketException):
+                return False
+            self._areas_read_at = time.monotonic()
+            return True
+
+        targets_ok, areas_ok = await asyncio.gather(refresh_targets(), refresh_areas())
+        return targets_ok, areas_ok
+
+    def delegation_context(self) -> dict[str, Any]:
+        now = time.monotonic()
+        areas = (self._area_names.copy() if now - self._areas_read_at < CONTEXT_MAX_AGE else {})
+        targets = self._script_targets()
+        if now < self._catalog_until - CATALOG_TTL + CONTEXT_MAX_AGE and self._catalog_until:
+            targets.extend(self._catalog_rows)
+        groups: dict[str, list[list[Any]]] = {}
+        for target in targets:
+            name = _target_label(target.names[0])
+            if name is None:
+                continue
+            rooms = [room for room in target.areas if _target_label(room)]
+            for room in rooms:
+                areas.setdefault(room, [])
+            aliases = [alias for alias in target.names[1:] if _target_label(alias)]
+            groups.setdefault(target.domain, []).append([name, rooms, aliases])
+        if not areas and not groups:
+            return {}
+        context = {"areas": dict(sorted(areas.items())), "entities": {
+            domain: sorted(rows) for domain, rows in sorted(groups.items())
+        }}
+        if len(json.dumps(context, ensure_ascii=False, separators=(",", ":")).encode()) > CONTEXT_MAX_BYTES:
+            context["entities"] = {}
+            context["entities_omitted"] = True
+            if len(json.dumps(context, ensure_ascii=False, separators=(",", ":")).encode()) > CONTEXT_MAX_BYTES:
+                return {}
+        return context
+
+    async def _find_target(self, name: str, domains: tuple[str, ...] = (), area: str | None = None,
+                           *, suggest: bool = False) -> dict[str, Any]:
+        devices = [] if domains and set(domains) == {"script"} else await self._target_catalog()
+        catalogue = devices + self._script_targets()
+        matches = find_targets(name, catalogue, domains=domains, area=area)
         if len(matches) == 1:
             return {"ok": True, **matches[0].reference()}
         if matches:
             return {"ok": False, "error": "target_ambiguous", "options": [row.reference() for row in matches[:5]],
                     "feedback": "Meerdere doelen komen overeen. Vraag welk apparaat, script of welke scène is bedoeld."}
-        if domains == ("scene",):
-            return {"ok": False, "error": "target_not_found",
-                    "feedback": "Ik vind geen vrijgegeven scène met die naam. Vraag naar de volledige naam in Home Assistant."}
-        return {"ok": False, "error": "target_not_found", "feedback": "Geen eenduidige vrijgegeven naam gevonden."}
+        failure = {"ok": False, "error": "target_not_found", "feedback": "Geen eenduidige vrijgegeven naam gevonden."}
+        if suggest:
+            scope = domains or tuple(sorted(TARGET_DOMAINS))
+            candidates = []
+            for target in scoped_targets(catalogue, scope, area):
+                if not _target_label(target.names[0]):
+                    continue
+                candidate = target.reference()
+                aliases = [label for label in target.names[1:4] if _target_label(label)]
+                if aliases:
+                    candidate["aliases"] = aliases
+                candidates.append(candidate)
+            if len(candidates) > MAX_SUGGESTION_TARGETS or len(json.dumps(candidates).encode()) > MAX_OUTPUT:
+                failure["feedback"] = "Te veel mogelijke doelen. Vraag naar de ruimte of het soort apparaat en zoek opnieuw."
+            elif candidates:
+                failure.update(candidates=candidates,
+                               feedback="Vergelijk de omschrijving en gesprekscontext met deze doelen. Vraag door "
+                                        "als daaruit geen eenduidig doel volgt.")
+        return failure
 
     async def _resolve_operation(self, tool: str, arguments: dict[str, Any], label: str,
                                  domains: tuple[str, ...], area: str | None) -> dict[str, Any]:
@@ -577,6 +712,13 @@ class HomeAssistantTools:
         scope = domains or ((intrinsic,) if intrinsic else tuple(sorted(TARGET_DOMAINS - {"script"})))
         if "script" in scope:
             return {}
+        now = time.monotonic()
+        # An exact name from the background inventory can go straight to
+        # Assist. New names and fuzzy matches still use the shorter read cache.
+        if self._catalog_until <= now < self._catalog_until - CATALOG_TTL + CONTEXT_REFRESH_SECONDS:
+            matches = find_targets(label, self._catalog_rows, domains=scope, area=area)
+            if len(matches) == 1 and matches[0].names[0].casefold() == label.casefold():
+                return {"ok": True, **matches[0].reference()}
         return await self._find_target(label, scope, area)
 
     def _named_arguments(self, name: str, arguments: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
@@ -791,6 +933,34 @@ class HomeAssistantTools:
                 return await self._save_alias(arguments)
             label = _spoken_label(arguments.get("name"))
             area = _spoken_label(arguments.get("area"))
+            if name in (SET_AREA_DEVICES_TOOL, SET_LOCK_TOOL):
+                area_group = name == SET_AREA_DEVICES_TOOL
+                field = "area" if area_group else "name"
+                value = area if area_group else label
+                action = arguments.get("action")
+                actions = AREA_ACTIONS if area_group else LOCK_ACTIONS
+                required = {field, "action", "domain"} if area_group else {field, "action"}
+                if not value or not isinstance(action, str) or action not in actions or set(arguments) != required:
+                    return {"ok": False, "error": "invalid_tool_arguments"}
+                domain = arguments["domain"] if area_group else "lock"
+                if area_group:
+                    if not isinstance(domain, str) or domain not in AREA_DEVICE_DOMAINS:
+                        return {"ok": False, "error": "invalid_tool_arguments"}
+                else:
+                    locks = [target for target in await self._target_catalog() if target.domain == "lock"]
+                    if not locks:
+                        return {"ok": False, "error": "lock_not_exposed",
+                                "feedback": "Home Assistant biedt geen vrijgegeven slot aan via Assist."}
+                    matches = [target for target in locks if name_key(value) in map(name_key, target.names)]
+                    if len(matches) != 1:
+                        return {"ok": False, "error": "lock_target_not_unique",
+                                "feedback": "Ik kan geen uniek vrijgegeven slot met deze naam bepalen."}
+                    value = matches[0].names[0]
+                native = actions[action]
+                schema = self._tools[native]["parameters"]["properties"]["domain"]
+                target = {field: value, "domain": [domain] if schema.get("type") == "array" else domain}
+                result = await self.execute(native, target, _resolve_alias=False, _resolve_name=False)
+                return {**result, f"resolved_{field}": value, "resolved_domain": domain}
             if name == ACTIVATE_SCENE_TOOL:
                 if not label or (arguments.get("area") is not None and not area) or set(arguments) - {"name", "area"}:
                     return {"ok": False, "error": "invalid_tool_arguments"}
@@ -816,7 +986,7 @@ class HomeAssistantTools:
                             return {"ok": False, "error": "alias_target_unavailable"}
                         reference["tool"] = script
                     return {"ok": True, **reference, "resolved_name": alias["name"], "resolved_domain": alias["domain"]}
-                return await self._find_target(label, domains, area)
+                return await self._find_target(label, domains, area, suggest=True)
             if alias:
                 return await self._execute_alias(name, arguments, alias)
             resolved = None

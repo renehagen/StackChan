@@ -11,7 +11,7 @@ import unittest
 from urllib.error import HTTPError
 
 from bridge.home_assistant import (
-    HomeAssistantError, HomeAssistantTools, MAX_BODY, MAX_OUTPUT,
+    CATALOG_TTL, HomeAssistantError, HomeAssistantTools, MAX_BODY, MAX_OUTPUT,
     PROTOCOL_VERSION, _NoRedirect, _decode_response,
 )
 
@@ -97,6 +97,82 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         result = await self.client.execute("ha_HassTurnOn", {"name": "living room"})
         self.assertEqual(result, {"ok": True, "text": "Lamp is on"})
         self.assertEqual(self.fake.calls, [{"name": "HassTurnOn", "arguments": {"name": "living room"}}])
+
+    async def test_delegation_inventory_reuses_catalogue_for_exact_action(self):
+        properties = {"name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "array"}}
+        self.fake.catalog[0]["inputSchema"]["properties"] = properties
+        self.fake.catalog[1]["inputSchema"]["properties"] = properties
+        await self.client.initialize()
+        overview = ("- names: Eettafel, Hanglamp\n  domain: light\n  areas: Keuken\n  state: 'on'\n"
+                    "- names: Voordeur\n  domain: lock\n  state: locked\n")
+        calls = []
+
+        async def rpc(method, params):
+            calls.append(params)
+            if params["name"] == "GetLiveContext":
+                return {"content": [{"text": json.dumps({"success": True, "result": overview})}]}
+            return {"content": [{"type": "text", "text": "OK"}]}
+
+        async def areas():
+            return {"Keuken": ["Kookhoek"], "Berging": []}
+
+        self.client._rpc = rpc
+        self.client._read_areas = areas
+        self.assertEqual(await self.client.refresh_context(), (True, True))
+        self.assertEqual(self.client.delegation_context(), {
+            "areas": {"Berging": [], "Keuken": ["Kookhoek"]},
+            "entities": {"light": [["Eettafel", ["Keuken"], ["Hanglamp"]]],
+                         "lock": [["Voordeur", [], []]]},
+        })
+        self.client._catalog_until -= CATALOG_TTL + 1
+        target = {"name": "Eettafel", "domain": ["light"], "area": "Keuken"}
+        self.assertTrue((await self.client.execute("ha_HassTurnOn", target))["ok"])
+        self.assertEqual(calls, [{"name": "GetLiveContext", "arguments": {}},
+                                 {"name": "HassTurnOn", "arguments": target}])
+        await self.client.execute("ha_GetLiveContext", target)
+        self.assertEqual(calls[-1], {"name": "GetLiveContext", "arguments": target})
+
+    async def test_area_devices_and_exact_exposed_lock_use_scoped_native_intents(self):
+        properties = {"name": {"type": "string"}, "area": {"type": "string"},
+                      "domain": {"type": "array"}}
+        self.fake.catalog[1]["inputSchema"]["properties"] = properties
+        self.fake.catalog.append({"name": "HassTurnOff", "inputSchema": {"type": "object", "properties": properties}})
+        await self.client.initialize()
+        catalogue = "- names: Voordeur\n  domain: light\n"
+        commands = []
+
+        async def rpc(method, params):
+            if params["name"] == "GetLiveContext":
+                result = json.dumps({"success": True, "result": catalogue})
+                return {"content": [{"type": "text", "text": result}]}
+            commands.append(params)
+            return {"content": [{"type": "text", "text": "OK"}]}
+
+        self.client._rpc = rpc
+        room = await self.client.execute("ha_SetAreaDevices", {"area": "Keuken", "domain": "light", "action": "on"})
+        self.assertTrue(room["ok"])
+        self.assertEqual(room["resolved_area"], "Keuken")
+        fan = await self.client.execute("ha_SetAreaDevices", {"area": "Badkamer", "domain": "fan", "action": "off"})
+        self.assertTrue(fan["ok"])
+        for invalid in ({"area": "Keuken", "action": "off"},
+                        {"area": "Keuken", "domain": "lock", "action": "off"},
+                        {"area": "Keuken", "domain": "light", "action": "off", "name": "Eettafel"}):
+            self.assertEqual((await self.client.execute("ha_SetAreaDevices", invalid))["error"],
+                             "invalid_tool_arguments")
+        door = await self.client.execute("ha_SetLock", {"name": "Voordeur", "action": "unlock"})
+        self.assertEqual(door["error"], "lock_not_exposed")
+        catalogue += "- names: Voordeur, Voordeur slot\n  domain: lock\n- names: Achterdeur\n  domain: lock\n"
+        self.client._catalog_until = 0
+        self.assertEqual((await self.client.execute("ha_SetLock", {"name": "Deur", "action": "unlock"}))["error"],
+                         "lock_target_not_unique")
+        door = await self.client.execute("ha_SetLock", {"name": "Voordeur slot", "action": "unlock"})
+        self.assertTrue(door["ok"])
+        self.assertEqual(door["resolved_name"], "Voordeur")
+        self.assertEqual(commands, [
+            {"name": "HassTurnOn", "arguments": {"area": "Keuken", "domain": ["light"]}},
+            {"name": "HassTurnOff", "arguments": {"area": "Badkamer", "domain": ["fan"]}},
+            {"name": "HassTurnOff", "arguments": {"name": "Voordeur", "domain": ["lock"]}},
+        ])
 
     async def test_timed_out_status_retries_once_and_action_does_not_retry(self):
         await self.client.initialize()
@@ -470,6 +546,72 @@ class HomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"], "target_ambiguous")
         self.assertEqual(len(result["options"]), 2)
         self.assertEqual([call["name"] for call in calls], ["GetLiveContext", "HassTurnOn", "GetLiveContext"])
+
+    async def test_unmatched_description_returns_scoped_candidates_without_dispatch(self):
+        for tool in self.fake.catalog[:2]:
+            tool["inputSchema"]["properties"].update(name={"type": "string"}, domain={"type": "array"})
+        await self.client.initialize()
+        overview = ("- names: Eettafel, Hanglamp\n  domain: light\n  areas: Woonkamer\n"
+                    "- names: Keukenlamp\n  domain: light\n  areas: Keuken\n"
+                    "- names: Stekker\n  domain: switch\n  areas: Woonkamer\n"
+                    "- names: Avond woonkamer\n  domain: scene\n")
+        calls = []
+
+        async def rpc(method, params):
+            calls.append(params["name"])
+            return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": overview})}]}
+
+        self.client._rpc = rpc
+        result = await self.client.execute("ha_FindTarget", {
+            "name": "Licht waar we eten", "domain": "light", "area": "Woonkamer",
+        })
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "target_not_found")
+        self.assertEqual(result["candidates"], [
+            {"name": "Eettafel", "domain": "light", "area": "Woonkamer", "aliases": ["Hanglamp"]},
+        ])
+        scene = await self.client.execute("ha_ActivateScene", {"name": "Sfeerverlichting voor vanavond", "area": "Woonkamer"})
+        self.assertFalse(scene["ok"])
+        self.assertEqual(scene["candidates"], [{"name": "Avond woonkamer", "domain": "scene", "area": None}])
+        exact = await self.client.execute("ha_FindTarget", {"name": "Hanglamp"})
+        self.assertTrue(exact["ok"])
+        self.assertNotIn("candidates", exact)
+        self.assertEqual(calls, ["GetLiveContext"])
+
+    async def test_blind_scene_aliases_dispatch_once_to_matching_scenes(self):
+        for tool in self.fake.catalog[:2]:
+            tool["inputSchema"]["properties"].update(name={"type": "string"}, domain={"type": "array"})
+        cache = Path(self.tmp.name) / "cache.json"
+        client = HomeAssistantTools(self.path, cache_path=cache)
+        client._opener = self.fake
+        await client.initialize()
+        actions = []
+
+        async def rpc(method, params):
+            name = params["arguments"].get("name")
+            if params["name"] == "GetLiveContext":
+                self.assertIn(name, ("Blinds closed", "Blinds open"))
+                context = f"- names: {name}\n  domain: scene\n"
+                return {"content": [{"type": "text", "text": json.dumps({"success": True, "result": context})}]}
+            actions.append(params)
+            return {"content": [{"type": "text", "text": "Activated"}]}
+
+        client._rpc = rpc
+        aliases = (("gordijnen dicht", "Blinds closed"), ("gordijnen open", "Blinds open"))
+        for alias, scene in aliases:
+            result = await client.execute("ha_SaveAlias", {"alias": alias, "target": scene, "domain": "scene"})
+            self.assertTrue(result["ok"], result)
+        self.assertEqual(actions, [])
+
+        restarted = HomeAssistantTools(self.path, cache_path=cache)
+        restarted._opener = self.fake
+        await restarted.initialize()
+        restarted._rpc = rpc
+        for alias, scene in aliases:
+            result = await restarted.execute("ha_ActivateScene", {"name": alias})
+            self.assertEqual((result["ok"], result["resolved_name"]), (True, scene))
+        self.assertEqual(actions, [{"name": "HassTurnOn", "arguments": {"name": scene, "domain": ["scene"]}}
+                                   for _, scene in aliases])
 
     async def test_atoms3_color_uses_the_configured_script_once(self):
         self.fake.catalog[0]["inputSchema"]["properties"]["name"] = {"type": "string"}

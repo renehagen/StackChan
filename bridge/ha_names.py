@@ -127,10 +127,23 @@ def _score(query: str, name: str, *, stripped: bool, domain: str) -> float:
     return score if edits <= (2 if max(len(left), len(right)) >= 10 else 1) and score >= minimum else 0.0
 
 
+def scoped_targets(targets: list[Target], domains: tuple[str, ...], area: str | None) -> list[Target]:
+    area_key = name_key(area) if area else None
+    scene_only = domains == ("scene",)
+    scoped = []
+    for target in targets:
+        if domains and target.domain not in domains:
+            continue
+        if area_key and area_key not in {name_key(value) for value in target.areas}:
+            if not (scene_only and not target.areas and _scene_room_in_name(target, area)):
+                continue
+        scoped.append(target)
+    return scoped
+
+
 def find_targets(query: str, targets: list[Target], *, domains: tuple[str, ...] = (),
                  area: str | None = None) -> list[Target]:
     variants = _name_variants(query)
-    area_key = name_key(area) if area else None
     scene_only = domains == ("scene",)
     leads = {_words(value) for value, inferred in variants if inferred in (None, "scene")} if scene_only else set()
     if leads and area:
@@ -139,12 +152,7 @@ def find_targets(query: str, targets: list[Target], *, domains: tuple[str, ...] 
     leads = {lead for lead in leads if len(lead) >= 2}
     scored = []
     prefixes: list[tuple[Target, bool]] = []
-    for target in targets:
-        if domains and target.domain not in domains:
-            continue
-        if area_key and area_key not in {name_key(value) for value in target.areas}:
-            if not (scene_only and not target.areas and _scene_room_in_name(target, area)):
-                continue
+    for target in scoped_targets(targets, domains, area):
         score = max((_score(value, name, stripped=bool(inferred), domain=target.domain)
                      for value, inferred in variants if inferred in (None, target.domain)
                      for name in target.names), default=0.0)

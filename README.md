@@ -1,6 +1,6 @@
 # StackChan met GPT Live — versie 1.0.0
 
-Firmwareprototype voor de **officiële M5Stack StackChan met CoreS3**, met Nederlandse spraakgesprekken via **OpenAI `gpt-live-1`**. Een lokale Python-bridge op de Mac verbindt de robot met OpenAI. Die Mac moet tijdens gesprekken aanstaan en op hetzelfde bereikbare netwerk zitten. De OpenAI-sleutel blijft op de Mac.
+Firmwareprototype voor de **officiële M5Stack StackChan met CoreS3**, met Nederlandse spraakgesprekken via **OpenAI `gpt-live-1.1`**. Een lokale Python-bridge op de Mac verbindt de robot met OpenAI. Die Mac moet tijdens gesprekken aanstaan en op hetzelfde bereikbare netwerk zitten. De OpenAI-sleutel blijft op de Mac.
 
 Na afloop van een gesprek staat **Gesprek gestopt** in het midden tot de slaapstand ingaat. Tijdens luisteren en spreken toont het scherm andere audiogolven. Onderin staan de microfoon, het volume en de gespreksknop. Tijdens een gesproken antwoord draait of knikt het hoofd af en toe.
 
@@ -13,6 +13,9 @@ Tijdens een gesprek verdwijnen de knoppen na 10 seconden zonder aanraking. Tik e
 - Na één minuut zonder gesprek of aanraking gaat het scherm uit en kantelt het hoofd naar de laagste gekalibreerde stand. Zeg tijdens een gesprek **‘Ga slapen’** of **‘Ga in slaapstand’** om het scherm meteen uit te zetten en het hoofd te laten zakken terwijl de bridge het gesprek afsluit. Op batterij gaan daarna wifi, audio en servovoeding uit en slaapt de processor tussen korte aanraakcontroles. Op USB-voeding blijven wifi, de bridgeverbinding en audio gereed. Strijk bovenop of tik op het scherm om de StackChan te wekken. Het hoofd komt omhoog, het scherm gaat aan op 30% en er start automatisch een gesprek zodra de bridge bereikbaar is. Spreek zodra de microfoon rechts verschijnt.
 - Op batterij staat het laadpercentage rechts in de bovenbalk naast het wifi-icoon.
 - Tik rechtsonder op **Start**. Spreek zodra de microfoon rechts verschijnt.
+- Linksboven staan het bedrag van het huidige gesprek, **Totaal** voor GPT-Live-spraak en **Tools** voor Responses, Decisions en webzoeken, allemaal in dollars. Het gespreksbedrag begint bij **Start**, blijft staan tijdens gesloten wachttijd en telt verder na spraakhervatting. De bridge bewaart afgesloten GPT-Live-verbindingen, Responses en Decisions per aanvraag in `.local/voice-cost.sqlite3`. De doorlopende spraakteller omvat ook de schatting voor de actieve verbinding. Tools gebruikt het door OpenAI gemelde tokengebruik, de standaardtarieven van GPT-5.6 Luna en GPT-6 Luna en het gemelde aantal factureerbare webzoekopdrachten. De bridge neemt historische spraakduur mee uit de logs. De toolteller begint zodra die gebruiksvelden worden geregistreerd.
+- De bridge sluit de OpenAI-sessie na 45 seconden zonder antwoord, uitgevoerde tool of aanvaarde spraakhervatting. Lopende lokale toolaanroepen mogen eerst afronden. Akoestische activiteitsmeldingen dienen als diagnostiek. De microfoon en luistergolf blijven zichtbaar. Een klein doorgestreept wolkje in de statusbalk geeft aan dat de sessie gesloten is. De microfoon blijft lokaal actief. Een drempel boven het achtergrondgeluid en een minimumduur helpen zachte geluiden en losse tikken te negeren. Tijdens het verbinden buffert de firmware de eerste woorden. Decisions beoordeelt na een spraakstart of de zin voor StackChan bedoeld is. De bridge houdt antwoorden en lokale tools tegen tot die beoordeling binnen is. Bij afwijzing sluit hij de sessie en wacht StackChan eerst op rust voordat de lokale detectie opnieuw kan starten. Recente gespreksregels blijven alleen in het werkgeheugen om context te kunnen meegeven. Tik op **Stop** om ook het wachten op spraak te beëindigen.
+- Zeg **‘Pauzeer het gesprek’** of **‘Wacht op wake word’** voor de strikte pauze. De bridge herkent deze opdrachten ook rechtstreeks in de GPT Live-transcriptie. Alleen **Wacht op wake word** blijft op het scherm staan, op 25% helderheid. De melding verplaatst iedere 30 seconden en de bovenste leds pulseren groen tussen ongeveer 10% en 24%, met één puls per 3,6 seconden. De OpenAI-verbinding sluit. De StackChan stuurt microfoonaudio via de lokale TLS-verbinding naar de bridge, die offline met Whisper het begin van een zin controleert. **Chatty**, **Hey Chatty** en **Hi Chatty** openen GPT Live met dezelfde gesprekscontext, zonder Decisions. De bridge bewaart daarbij kort het begin van je vraag in het werkgeheugen.
 - **Stop** stopt de lokale audio en sluit de OpenAI-sessie af.
 - Met **Demp** linksonder zet je de microfoon stil. Tik op **Mic aan** om verder te praten.
 - Zeg **‘Stop het gesprek’**, **‘Zet je volume op 70 procent’** of **‘Demp de microfoon’** om de StackChan zelf te bedienen. Na dempen tik je op **Mic aan** om weer te kunnen praten.
@@ -25,15 +28,17 @@ De eerste versie ondersteunt **om de beurt praten**. Tijdens hoorbare robotspraa
 
 ## Ontwerp
 
+Installeer voor het offline wekwoord `bridge/requirements-wake.txt` in de venv van de bridge en zet het officiële meertalige [whisper.cpp-basismodel](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-base.bin) in `.local/wake/ggml-base.bin`. De bridge laadt het model op de CPU tijdens het opstarten.
+
 ```mermaid
 flowchart LR
     A[CoreS3: microfoon en scherm] <-->|WSS · PCM16 mono 16 kHz| B[Lokale Python-bridge]
-    B <-->|Live WebSocket API| C[gpt-live-1]
+    B <-->|Live WebSocket API| C[gpt-live-1.1]
     C <-->|Managed Responses-delegatie| D[gpt-5.6-luna]
     B --- E[Lokale OpenAI-sleutel]
 ```
 
-`gpt-live-1` gebruikt de **Live API**, met eigen eventnamen. De bridge opent `wss://api.openai.com/v1/live/sessions`, stuurt `session.start` en wacht op `session.started`. Daarna stroomt audio continu, inclusief stilte. De standaarddelegatie naar `gpt-5.6-luna` gebruikt hosted webzoeken en lokale Home Assistant-functies. De Live-commando's `response.item.create` en `response.create` geven toolresultaten terug en hervatten de backend; er wordt geen oude Realtime-audiocyclus gebruikt.
+`gpt-live-1.1` gebruikt de **Live API**, met eigen eventnamen. De bridge opent `wss://api.openai.com/v1/live/sessions`, stuurt `session.start` en wacht op `session.started`. Daarna stroomt audio continu, inclusief stilte. De standaarddelegatie naar `gpt-5.6-luna` gebruikt hosted webzoeken en lokale Home Assistant-functies. De Live-commando's `response.item.create` en `response.create` geven toolresultaten terug en hervatten de backend; er wordt geen oude Realtime-audiocyclus gebruikt.
 
 ## Webzoeken en Home Assistant
 
@@ -47,7 +52,7 @@ Scripts die in Home Assistant voor Assist zijn vrijgegeven verschijnen als apart
 
 Voor de AtomS3-ledstrip gebruikt StackChan het [AtomS3-script](docs/atoms3-ledstrip-script.yaml). Voeg het toe aan `scripts.yaml`, herlaad de scripts, geef `script.stackchan_atoms3_ledstrip` vrij aan Assist en voeg `stackchan_atoms3_ledstrip` toe aan `STACKCHAN_HA_SCRIPTS`. Zeg bijvoorbeeld ‘Zet het effect van de AtomS3-ledstrip op Rainbow’ of ‘Zet de AtomS3-ledstrip op groen’. Bij een vaste kleur wacht het script op de bevestiging van `Solid` en stelt daarna de kleur in.
 
-De bridge vergelijkt gesproken namen met de vrijgegeven namen en aliassen uit Assist en de ingestelde scripttools. Spaties, leestekens, accenten en kleine typefouten mogen afwijken. Geef bij gelijknamige doelen zo nodig de ruimte of het soort, bijvoorbeeld lamp, script of scène. Bij vergelijkbare matches vraagt StackChan welke je bedoelt. Bij een gevonden schrijfvariant gebruikt de bridge de vrijgegeven naam voor de bediening.
+De bridge vergelijkt gesproken namen met de vrijgegeven namen en aliassen uit Assist en de ingestelde scripttools. Spaties, leestekens, accenten en kleine typefouten mogen afwijken. Geef bij gelijknamige doelen zo nodig de ruimte of het soort, bijvoorbeeld lamp, script of scène. Bij vergelijkbare matches vraagt StackChan welke je bedoelt. Bij een gevonden schrijfvariant gebruikt de bridge de vrijgegeven naam voor de bediening. Als de gewone zoekactie geen match vindt, vergelijkt het Responses-model de omschrijving met vrijgegeven namen, aliassen, ruimtes en types. StackChan vraagt om bevestiging voordat hij een voorgesteld doel bedient.
 
 De bridge onthoudt maximaal 32 bevestigde opdrachten voor één benoemd apparaat, één scène of een vrijgegeven script. Bij een exacte match op hetzelfde type opdracht kan StackChan de zoekstap overslaan. Home Assistant voert de opdracht opnieuw uit. De cache bewaart alleen naam, ruimte, domein, soort opdracht en vervaldatum in `.local/ha-target-cache.json`. Een doel vervalt na drie dagen of na een mislukte naam- of ruimtematch. Voor een actuele status vraagt StackChan Home Assistant.
 
@@ -55,7 +60,9 @@ Bij een naam zoals ‘Eettafel lamp’ of ‘eettafellamp’ telt ook ‘Eettafe
 
 Zeg bijvoorbeeld **‘Sla tv1 op als alias voor 32 inch The Frame’** en daarna **‘Zet tv1 aan’**. De bridge controleert het doel in Home Assistant en bewaart maximaal 32 uitgesproken aliassen in hetzelfde lokale cachebestand. Deze aliassen blijven bewaard na een herstart en hebben geen vervaldatum. Zeg expliciet dat je een bestaande alias wilt wijzigen om hem aan een ander doel te koppelen.
 
-De adapter gebruikt `/api/mcp/assist` en biedt bekende Assist-functies voor status, lampen, klimaat, ventilatie en media. Administratieve, alarm-, slot- en berichtfuncties worden niet toegevoegd. Zoek status bij voorkeur gericht op naam, ruimte of domein; grote overzichten krijgen een expliciete begrenzingsmelding. Voorbeelden: “Staat de eettafellamp aan?” en “Zet de eettafellamp op vijftig procent.”
+De adapter gebruikt `/api/mcp/assist` en biedt bekende Assist-functies voor status, lampen, klimaat, ventilatie en media. Bij “Zet de lampen in de keuken aan” stuurt Responses één groepsopdracht met de ruimte en het apparaattype. Bij een individueel doel gebruikt Responses ook de omschrijving, gesprekscontext en de vrijgegeven namen en aliassen. Bij onduidelijkheid die na die zoekstap overblijft, stelt StackChan een vraag. Een opdracht voor een slot vereist één exacte naam of alias die Home Assistant aan Assist heeft vrijgegeven. Voorbeeld van een statusvraag over één apparaat is “Staat de eettafellamp aan?”
+
+De bridge haalt bij het opstarten en daarna elke vijf minuten de ruimtenamen en -aliassen uit het Home Assistant-ruimteregister en de vrijgegeven doelen uit Assist. Nieuwe GPT Live-sessies krijgen deze catalogus als compacte Responses-context met naam, type, ruimte en aliassen. Ook lege ruimtes en ingeschakelde StackChan-scripts staan erin. Responses kan een eenduidig doel direct bedienen. Voor actuele status of een onduidelijk doel kan het Home Assistant raadplegen. De catalogus bevat geen apparaatstatus of inloggegevens.
 
 De toolworker werkt los van de audio. Opdrachten worden één keer uitgevoerd; Stop annuleert nog niet gestarte opdrachten. Een reeds naar Home Assistant verstuurde opdracht kan nog afronden. Fouten worden als fouten teruggegeven en beëindigen het spraakgesprek niet. Er is geen algemene REST-servicefallback.
 
@@ -157,7 +164,7 @@ De weergavestand en de hoogte van de audiogolf volgen de lokale audio. De scherm
 
 ## Bronnen
 
-- [OpenAI GPT Live-model](https://developers.openai.com/api/docs/models/gpt-live-1)
+- [OpenAI GPT Live-model](https://developers.openai.com/api/docs/models/gpt-live-1.1)
 - [Live WebSocket-protocol en events](https://developers.openai.com/api/reference/resources/live/primary-websocket)
 - [OpenAI WebSocket-audiogids](https://developers.openai.com/api/docs/guides/voice-websockets?api=live)
 - [Officiële M5Stack StackChan-hardware](https://docs.m5stack.com/en/StackChan/)

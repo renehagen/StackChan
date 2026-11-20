@@ -18,6 +18,7 @@ constexpr int kLegMs = 470;
 constexpr uint32_t kBetweenGesturesMs = 7800;
 constexpr uint8_t kTorque = 40, kGoal = 42, kFeedback = 56;
 constexpr int kMinimumUprightOffset = 16, kDefaultUprightOffset = 48;
+constexpr int kPitchRecoveryBelowZero = 24;
 constexpr char kYawCenterKey[] = "yaw_center";
 constexpr int kAlignmentStep = 8, kYawTolerance = 5;
 struct Axis {
@@ -325,7 +326,9 @@ void run(void*) {
   unsigned phase = 0;
   uint32_t last = millis()-kBetweenGesturesMs;
   bool parked = false;
-  const int lowestReachablePitch = std::max(pitch.rawLow, zeroPitch - 4);
+  // With the servo released, the head can settle below its calibrated zero.
+  // Allow a small undershoot only as the starting point for an upward move.
+  const int lowestReachablePitch = std::max(pitch.rawLow, zeroPitch - kPitchRecoveryBelowZero);
   const int uprightThreshold = pitch.low + kMinimumUprightOffset;
   const int defaultUpright = std::min(pitch.high, pitch.low + kDefaultUprightOffset);
   int wakePitch = defaultUpright;
@@ -408,7 +411,7 @@ void run(void*) {
       conversationAt = current;
       ++conversationChecks;
       if (current < lowestReachablePitch || current > pitch.high) {
-        status = current < 0 ? "conversation_feedback" : "outside_range";
+        status = current < 0 ? "conversation_feedback" : "conversation_pitch_range";
         continue;
       }
       if (current < uprightThreshold) {
